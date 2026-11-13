@@ -1,0 +1,4 @@
+[wokwi]
+version = 1
+firmware = '.pio/build/atoms3_sim/firmware.factory.bin'
+elf = '.pio/build/atoms3_sim/firmware.elf'

@@ -1,0 +1,26 @@
+{
+  "operating_mode": "auto",
+  "manual_speed": 0,
+  "manual_timeout_mins": 0,
+  "room_volume_m3": 150.0,
+  "ag_serial": "9888e0eefcec",
+  "ag_target_host": "",
+  "poll_interval_sec": 60,
+  "enable_multigas": true,
+  "tz_posix": "SGT-8",
+  "day_start_hour": 8,
+  "night_start_hour": 23,
+  "night_led_enabled": false,
+  "ir_nec_address": "0xFF00",
+  "ir_codes": {
+    "off": "0xFF00",
+    "speed_1": "0xE817",
+    "speed_2": "0xFC03",
+    "speed_3": "0xFD02",
+    "speed_4": "0xFA05",
+    "speed_5": "0xFB04",
+    "speed_6": "0xE916"
+  },
+  "wake_require_speed1_prefix": true,
+  "ir_refresh_mins": 15
+}

@@ -1,0 +1,16 @@
+{
+  "iqair-command-guard": {
+    "PreToolUse": [
+      {
+        "matcher": "run_command",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 hooks/guard_commands.py",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

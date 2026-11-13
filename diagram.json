@@ -1,0 +1,60 @@
+{
+  "version": 1,
+  "author": "iqair-controller",
+  "editor": "wokwi",
+  "parts": [
+    {
+      "type": "board-esp32-s3-devkitc-1",
+      "id": "esp",
+      "top": 0,
+      "left": 0,
+      "attrs": {
+        "flashSize": "8",
+        "serialInterface": "USB_SERIAL_JTAG"
+      }
+    },
+    {
+      "type": "wokwi-logic-analyzer",
+      "id": "la1",
+      "top": -120,
+      "left": 240,
+      "attrs": {
+        "channelNames": "IR"
+      }
+    },
+    {
+      "type": "wokwi-neopixel",
+      "id": "rgb1",
+      "top": 60,
+      "left": 240,
+      "attrs": {}
+    },
+    {
+      "type": "wokwi-pushbutton",
+      "id": "btn1",
+      "top": 150,
+      "left": 240,
+      "attrs": {}
+    },
+    {
+      "type": "wokwi-resistor",
+      "id": "r1",
+      "top": 190,
+      "left": 140,
+      "attrs": {
+        "value": "10000"
+      }
+    }
+  ],
+  "connections": [
+    ["esp:4", "la1:D0", "green", []],
+    ["esp:GND.2", "la1:GND", "black", []],
+    ["esp:35", "rgb1:DIN", "green", []],
+    ["esp:3V3.1", "rgb1:VDD", "red", []],
+    ["esp:GND.1", "rgb1:VSS", "black", []],
+    ["esp:41", "btn1:1.l", "blue", []],
+    ["esp:GND.3", "btn1:2.l", "black", []],
+    ["esp:41", "r1:1", "blue", []],
+    ["esp:3V3.2", "r1:2", "red", []]
+  ]
+}

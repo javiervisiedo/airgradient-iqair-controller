@@ -1,0 +1,9 @@
+name: 'TC-03 wake from off to speed 4 IR'
+version: 1
+steps:
+  - wait-serial: 'setup done'
+  - write-serial: "inject pm25=42.0\n"
+  - wait-serial: 'cmd=4'
+  - wait-serial: 'TX speed 1 cmd 0xE817'
+  - wait-serial: 'TX speed 4 cmd 0xFA05'
+  - delay: 300ms

@@ -1,0 +1,40 @@
+# PlatformIO build & test outputs
+.pio/
+.pioenvs/
+.piolibdeps/
+compile_commands.json
+
+# Secrets & local environment overrides (use *.example templates instead)
+include/secrets.h
+.env
+.env.*
+!.env.example
+
+# Wokwi simulation outputs & waveform captures
+sim-out/
+*.vcd
+
+# Python & virtual environments
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.venv/
+venv/
+
+# Compiled binaries / object artifacts outside .pio
+*.o
+*.d
+*.elf
+*.bin
+*.map
+
+# OS & editor files
+.DS_Store
+._*
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
