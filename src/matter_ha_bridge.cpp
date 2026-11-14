@@ -65,6 +65,7 @@ bool ota_header_is_valid(const uint8_t* data, size_t len) {
 #include <app/clusters/air-quality-server/air-quality-server.h>
 #include <app/clusters/time-synchronization-server/DefaultTimeSyncDelegate.h>
 #include <app/server/Server.h>
+#include <app/util/attribute-storage-null-handling.h>
 #include <app/util/attribute-storage.h>
 #include <esp_app_format.h>
 #include <esp_http_server.h>
@@ -151,7 +152,184 @@ class TimeSyncDelegate : public chip::app::Clusters::TimeSynchronization::Defaul
 };
 TimeSyncDelegate g_time_sync_delegate;
 
-MatterFan g_fan;
+bool post(const BridgeCmd& c, TickType_t wait = 0);
+
+// Exposes protected ArduinoMatter::_init() so EP1 can initialize the Matter node
+// before AirQualityEndpoint (EP2) and MatterOnOffPlugin (EP3) are created.
+struct MatterNodeAccessor : public ArduinoMatter {
+  static void ensure_init() { _init(); }
+};
+
+// ---------------------------------------------------------------------------
+// EP1: Air Purifier (0x002D) or Fan (0x002B) with FanControl Auto feature.
+// Subclasses MatterEndPoint directly rather than using MatterFan so EP1 carries
+// a single primary device type (no duplicate Fan tile in Apple Home), enables
+// Feature::kAuto (0x2) on FanControl, and avoids stale cached FanMode drops.
+// ---------------------------------------------------------------------------
+class AirPurifierEndpoint : public MatterEndPoint {
+ public:
+  bool begin() {
+    MatterNodeAccessor::ensure_init();
+    if (getEndPointId() != 0) return true;
+    endpoint_t* ep = nullptr;
+#if defined(IAQ_MATTER_AIR_PURIFIER_TYPE) && IAQ_MATTER_AIR_PURIFIER_TYPE
+    endpoint::air_purifier::config_t ep_cfg;
+    ep_cfg.fan_control.fan_mode = chip::to_underlying(FanControl::FanModeEnum::kAuto);
+    ep_cfg.fan_control.fan_mode_sequence =
+        chip::to_underlying(FanControl::FanModeSequenceEnum::kOffLowMedHighAuto);
+    ep_cfg.fan_control.percent_setting = nullable<uint8_t>();
+    ep_cfg.fan_control.percent_current = 0;
+    ep = endpoint::air_purifier::create(node::get(), &ep_cfg, ENDPOINT_FLAG_NONE, this);
+#else
+    endpoint::fan::config_t ep_cfg;
+    ep_cfg.fan_control.fan_mode = chip::to_underlying(FanControl::FanModeEnum::kAuto);
+    ep_cfg.fan_control.fan_mode_sequence =
+        chip::to_underlying(FanControl::FanModeSequenceEnum::kOffLowMedHighAuto);
+    ep_cfg.fan_control.percent_setting = nullable<uint8_t>();
+    ep_cfg.fan_control.percent_current = 0;
+    ep = endpoint::fan::create(node::get(), &ep_cfg, ENDPOINT_FLAG_NONE, this);
+#endif
+    if (ep == nullptr) {
+      ESP_LOGE(kTag, "air_purifier/fan endpoint create failed");
+      return false;
+    }
+    cluster_t* fc = cluster::get(ep, FanControl::Id);
+    if (fc == nullptr) {
+      ESP_LOGE(kTag, "FanControl cluster missing on EP");
+      return false;
+    }
+    if (cluster::fan_control::feature::fan_auto::add(fc) != ESP_OK) {
+      ESP_LOGE(kTag, "FanControl fan_auto feature add failed");
+      return false;
+    }
+    setEndPointId(endpoint::get_id(ep));
+    ESP_LOGI(kTag, "EP%u air purifier ready", getEndPointId());
+    return true;
+  }
+
+  bool attributeChangeCB(uint16_t endpoint_id, uint32_t cluster_id, uint32_t attribute_id,
+                         esp_matter_attr_val_t* val) override {
+    if (g_publishing) return true;
+    if (endpoint_id != getEndPointId() || cluster_id != FanControl::Id || val == nullptr) return true;
+    const uint32_t now = millis();
+    expire_burst(now);
+    switch (attribute_id) {
+      case FanControl::Attributes::FanMode::Id: {
+        const auto fm = static_cast<FanControl::FanModeEnum>(val->val.u8);
+        if (fm == FanControl::FanModeEnum::kOff && ignore_next_fan_mode_off_) {
+          ignore_next_fan_mode_off_ = false;
+          needs_sync_.store(true);
+          ESP_LOGD(kTag, "ignoring SetFanModeToOff from Auto-burst PercentSetting=0");
+          return true;
+        }
+        ignore_next_fan_mode_off_ = false;
+        switch (fm) {
+          case FanControl::FanModeEnum::kAuto:
+          case FanControl::FanModeEnum::kSmart:
+            last_auto_write_ms_ = now;
+            has_auto_write_ = true;
+            post(BridgeCmd{BridgeCmdType::SET_AUTO, 0, false, 0, 0});
+            needs_sync_.store(true);
+            break;
+          case FanControl::FanModeEnum::kOff:
+            has_auto_write_ = false;
+            post(BridgeCmd{BridgeCmdType::SET_MANUAL, 0, false, 0, 0});
+            needs_sync_.store(true);
+            break;
+          case FanControl::FanModeEnum::kLow:
+            has_auto_write_ = false;
+            post(BridgeCmd{BridgeCmdType::SET_MANUAL, 2, false, 0, 0});
+            needs_sync_.store(true);
+            break;
+          case FanControl::FanModeEnum::kMedium:
+            has_auto_write_ = false;
+            post(BridgeCmd{BridgeCmdType::SET_MANUAL, 4, false, 0, 0});
+            needs_sync_.store(true);
+            break;
+          case FanControl::FanModeEnum::kHigh:
+          case FanControl::FanModeEnum::kOn:
+            has_auto_write_ = false;
+            post(BridgeCmd{BridgeCmdType::SET_MANUAL, 6, false, 0, 0});
+            needs_sync_.store(true);
+            break;
+          default:
+            ESP_LOGW(kTag, "unsupported FanMode=%u", val->val.u8);
+            return false;
+        }
+        return true;
+      }
+      case FanControl::Attributes::PercentSetting::Id: {
+        if (val->type == ESP_MATTER_VAL_TYPE_NULLABLE_UINT8 &&
+            chip::app::NumericAttributeTraits<uint8_t>::IsNullValue(val->val.u8)) {
+          return true;  // Auto clears PercentSetting to null; never post SET_MANUAL
+        }
+        if (val->val.u8 > 100) {
+          ESP_LOGW(kTag, "ignoring invalid PercentSetting=%u", val->val.u8);
+          return false;
+        }
+        if (has_auto_write_) {
+          if (val->val.u8 == 0) {
+            // fan-control-server's PostAttributeChanged calls SetFanModeToOff() synchronously.
+            ignore_next_fan_mode_off_ = true;
+          }
+          needs_sync_.store(true);
+          ESP_LOGI(kTag, "ignoring burst PercentSetting=%u right after FanMode=Auto", val->val.u8);
+          return true;
+        }
+        has_auto_write_ = false;
+        ignore_next_fan_mode_off_ = false;
+        const uint8_t speed = static_cast<uint8_t>(iaq::percent_to_speed(val->val.u8));
+        post(BridgeCmd{BridgeCmdType::SET_MANUAL, speed, false, 0, 0});
+        esp_matter_attr_val_t pc = esp_matter_uint8(iaq::speed_to_percent(speed));
+        g_publishing = true;
+        updateAttributeVal(FanControl::Id, FanControl::Attributes::PercentCurrent::Id, &pc);
+        g_publishing = false;
+        needs_sync_.store(true);
+        return true;
+      }
+      default:
+        return true;
+    }
+  }
+
+  void set_auto(uint8_t pct) {
+    esp_matter_attr_val_t fm = esp_matter_enum8(chip::to_underlying(FanControl::FanModeEnum::kAuto));
+    updateAttributeVal(FanControl::Id, FanControl::Attributes::FanMode::Id, &fm);
+    // Ensure PercentSetting is null even if FanMode was already kAuto (e.g., burst write).
+    esp_matter_attr_val_t ps = esp_matter_nullable_uint8(nullable<uint8_t>());
+    updateAttributeVal(FanControl::Id, FanControl::Attributes::PercentSetting::Id, &ps);
+    esp_matter_attr_val_t pc = esp_matter_uint8(pct);
+    updateAttributeVal(FanControl::Id, FanControl::Attributes::PercentCurrent::Id, &pc);
+  }
+
+  void set_manual(FanControl::FanModeEnum mode, uint8_t pct) {
+    // Update FanMode before PercentSetting so PercentSetting != 0 isn't overwritten
+    // and PercentSetting = 0 matches Off cleanly.
+    esp_matter_attr_val_t fm = esp_matter_enum8(chip::to_underlying(mode));
+    updateAttributeVal(FanControl::Id, FanControl::Attributes::FanMode::Id, &fm);
+    esp_matter_attr_val_t ps = esp_matter_nullable_uint8(nullable<uint8_t>(pct));
+    updateAttributeVal(FanControl::Id, FanControl::Attributes::PercentSetting::Id, &ps);
+    esp_matter_attr_val_t pc = esp_matter_uint8(pct);
+    updateAttributeVal(FanControl::Id, FanControl::Attributes::PercentCurrent::Id, &pc);
+  }
+
+  bool take_needs_sync() { return needs_sync_.exchange(false); }
+  void expire_burst(uint32_t now) {
+    if (has_auto_write_ && (now - last_auto_write_ms_) >= kAutoBurstWindowMs) {
+      has_auto_write_ = false;
+      ignore_next_fan_mode_off_ = false;
+    }
+  }
+
+ private:
+  static constexpr uint32_t kAutoBurstWindowMs = 250;
+  uint32_t last_auto_write_ms_ = 0;
+  bool has_auto_write_ = false;
+  bool ignore_next_fan_mode_off_ = false;
+  std::atomic<bool> needs_sync_{false};
+};
+
+AirPurifierEndpoint g_purifier;
 MatterOnOffPlugin g_night_lock;
 
 // ---------------------------------------------------------------------------
@@ -287,7 +465,7 @@ class AirQualityEndpoint : public MatterEndPoint {
 
 AirQualityEndpoint g_aq;
 
-bool post(const BridgeCmd& c, TickType_t wait = 0) {
+bool post(const BridgeCmd& c, TickType_t wait) {
   if (g_self == nullptr || g_self->queue() == nullptr) return false;
   if (xQueueSend(g_self->queue(), &c, wait) != pdTRUE) {
     ESP_LOGW(kTag, "command queue full, dropped");
@@ -798,31 +976,8 @@ bool MatterHaBridge::begin(AppConfig* cfg, SemaphoreHandle_t cfg_mutex, QueueHan
     ESP_LOGI(kTag, "BLE memory released (free=%u)", static_cast<unsigned>(esp_get_free_heap_size()));
   });
 
-  // EP1: purifier fan (Off/Low/Med/High/Auto + percent slider)
-  if (!g_fan.begin(0, MatterFan::FAN_MODE_AUTO, MatterFan::FAN_MODE_SEQ_OFF_LOW_MED_HIGH_AUTO)) return false;
-#if IAQ_MATTER_AIR_PURIFIER_TYPE
-  endpoint_t* fan_ep = endpoint::get(node::get(), g_fan.getEndPointId());
-  if (fan_ep != nullptr) {
-    endpoint::add_device_type(fan_ep, endpoint::air_purifier::get_device_type_id(),
-                              endpoint::air_purifier::get_device_type_version());
-  }
-#endif
-  g_fan.onChangeMode([](MatterFan::FanMode_t m) -> bool {
-    if (g_publishing) return true;
-    switch (m) {
-      case MatterFan::FAN_MODE_AUTO: post(BridgeCmd{BridgeCmdType::SET_AUTO, 0, false, 0, 0}); break;
-      case MatterFan::FAN_MODE_OFF: post(BridgeCmd{BridgeCmdType::SET_MANUAL, 0, false, 0, 0}); break;
-      case MatterFan::FAN_MODE_LOW: post(BridgeCmd{BridgeCmdType::SET_MANUAL, 2, false, 0, 0}); break;
-      case MatterFan::FAN_MODE_MEDIUM: post(BridgeCmd{BridgeCmdType::SET_MANUAL, 4, false, 0, 0}); break;
-      default: post(BridgeCmd{BridgeCmdType::SET_MANUAL, 6, false, 0, 0}); break;  // High / On
-    }
-    return true;
-  });
-  g_fan.onChangeSpeedPercent([](uint8_t pct) -> bool {
-    if (g_publishing || pct > 100) return true;  // self-update, or null/invalid PercentSetting
-    post(BridgeCmd{BridgeCmdType::SET_MANUAL, static_cast<uint8_t>(iaq::percent_to_speed(pct)), false, 0, 0});
-    return true;
-  });
+  // EP1: air purifier / fan (Off/Low/Med/High/Auto + percent slider)
+  if (!g_purifier.begin()) return false;
 
   // EP2: composite air quality sensor
   if (!g_aq.begin()) return false;
@@ -962,29 +1117,27 @@ void MatterHaBridge::publish_work(intptr_t arg) {
 void MatterHaBridge::publish_matter(const StatusSnapshot& s) {
   g_publishing = true;  // CHIP task only (see publish_work)
 
-  // EP1 fan
+  // EP1 air purifier / fan
+  g_purifier.expire_burst(millis());
   const int mode = static_cast<int>(s.operating_mode);
-  if (s.current_speed != pub_speed_ || mode != pub_mode_) {
-    MatterFan::FanMode_t fm;
+  const bool cmd_idle = (cmd_q_ == nullptr || uxQueueMessagesWaiting(cmd_q_) == 0);
+  if (s.current_speed != pub_speed_ || mode != pub_mode_ || (cmd_idle && g_purifier.take_needs_sync())) {
+    if (cmd_idle) g_purifier.take_needs_sync();
+    const uint8_t pct = iaq::speed_to_percent(s.current_speed);
     if (s.operating_mode != OperatingMode::MANUAL) {
-      fm = MatterFan::FAN_MODE_AUTO;
-    } else if (s.current_speed == 0) {
-      fm = MatterFan::FAN_MODE_OFF;
-    } else if (s.current_speed <= 2) {
-      fm = MatterFan::FAN_MODE_LOW;
-    } else if (s.current_speed <= 4) {
-      fm = MatterFan::FAN_MODE_MEDIUM;
+      g_purifier.set_auto(pct);
     } else {
-      fm = MatterFan::FAN_MODE_HIGH;
-    }
-    g_fan.setMode(fm);
-    if (fm == MatterFan::FAN_MODE_AUTO) {
-      // In Auto the FanControl server keeps PercentSetting null; writing it would
-      // flip the mode (0 -> Off). Report the actual speed via PercentCurrent only.
-      esp_matter_attr_val_t pc = esp_matter_uint8(iaq::speed_to_percent(s.current_speed));
-      attribute::update(g_fan.getEndPointId(), FanControl::Id, FanControl::Attributes::PercentCurrent::Id, &pc);
-    } else {
-      g_fan.setSpeedPercent(iaq::speed_to_percent(s.current_speed));  // after mode: overrides presets
+      FanControl::FanModeEnum fm;
+      if (s.current_speed == 0) {
+        fm = FanControl::FanModeEnum::kOff;
+      } else if (s.current_speed <= 2) {
+        fm = FanControl::FanModeEnum::kLow;
+      } else if (s.current_speed <= 4) {
+        fm = FanControl::FanModeEnum::kMedium;
+      } else {
+        fm = FanControl::FanModeEnum::kHigh;
+      }
+      g_purifier.set_manual(fm, pct);
     }
     pub_speed_ = s.current_speed;
     pub_mode_ = mode;
