@@ -352,8 +352,6 @@ void ControlCore::anchor_algo_to_cap() {
 TickResult ControlCore::on_poll(bool ok, const Reading& r, bool is_night, uint32_t now_ms) {
   TickResult res{commanded_speed_, false, false, SensorFaultMonitor::Event::NONE};
   modes_.poll_timeout(now_ms);
-  const bool sensor_driven = modes_.mode() != OperatingMode::MANUAL;
-  if (last_mode_ == OperatingMode::MANUAL && sensor_driven) algo_.sync_current_speed(commanded_speed_);
   last_mode_ = modes_.mode();
   is_night_ = is_night;
 
@@ -380,8 +378,6 @@ TickResult ControlCore::on_mode_change(uint32_t now_ms, bool is_night) {
   TickResult res{commanded_speed_, false, false, SensorFaultMonitor::Event::NONE};
   modes_.poll_timeout(now_ms);
   is_night_ = is_night;
-  const bool sensor_driven = modes_.mode() != OperatingMode::MANUAL;
-  if (last_mode_ == OperatingMode::MANUAL && sensor_driven) algo_.sync_current_speed(commanded_speed_);
   last_mode_ = modes_.mode();
   set_commanded(target_for_mode(), &res);
   anchor_algo_to_cap();

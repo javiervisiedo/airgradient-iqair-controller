@@ -78,11 +78,26 @@ void test_TC01_matter_slider_sets_manual_and_auto_resumes() {
   TEST_ASSERT_EQUAL(OperatingMode::MANUAL, rig.core.modes().mode());
   TEST_ASSERT_EQUAL(4, r.commanded_speed);
   TEST_ASSERT_TRUE(r.speed_changed);
-  // Tile back to Auto -> algorithm resumes from the actual speed (no jump)
+  // Tile back to Auto -> immediately resumes the sensor-calculated Auto speed (3)
   rig.core.modes().set_auto(rig.now);
   r = rig.core.on_mode_change(rig.now, false);
   TEST_ASSERT_EQUAL(OperatingMode::AUTO, rig.core.modes().mode());
-  TEST_ASSERT_EQUAL(4, r.commanded_speed);
+  TEST_ASSERT_EQUAL(3, r.commanded_speed);
+  TEST_ASSERT_TRUE(r.speed_changed);
+
+  // Clean air (Auto speed 0), then Manual top speed (6), then back to Auto -> immediately 0
+  Rig clean_rig;
+  for (int i = 0; i < 3; ++i) clean_rig.ok(0.0f, 35.0f, 1.0f);
+  TEST_ASSERT_EQUAL(0, clean_rig.core.commanded_speed());
+  clean_rig.core.modes().set_manual(6, clean_rig.now);
+  r = clean_rig.core.on_mode_change(clean_rig.now, false);
+  TEST_ASSERT_EQUAL(6, r.commanded_speed);
+  TEST_ASSERT_TRUE(r.speed_changed);
+  clean_rig.core.modes().set_auto(clean_rig.now);
+  r = clean_rig.core.on_mode_change(clean_rig.now, false);
+  TEST_ASSERT_EQUAL(OperatingMode::AUTO, clean_rig.core.modes().mode());
+  TEST_ASSERT_EQUAL(0, r.commanded_speed);
+  TEST_ASSERT_TRUE(r.speed_changed);
 }
 
 void test_TC01_percent_speed_mapping_roundtrip() {

@@ -221,22 +221,31 @@ class AirPurifierEndpoint : public MatterEndPoint {
     switch (attribute_id) {
       case FanControl::Attributes::FanMode::Id: {
         const auto fm = static_cast<FanControl::FanModeEnum>(val->val.u8);
-        if (fm == FanControl::FanModeEnum::kOff && ignore_next_fan_mode_off_) {
+        if (fm == FanControl::FanModeEnum::kAuto || fm == FanControl::FanModeEnum::kSmart) {
           ignore_next_fan_mode_off_ = false;
+          last_auto_write_ms_ = now;
+          has_auto_write_ = true;
+          ESP_LOGI(kTag, "FanControl rx FanMode=%u (Auto)", val->val.u8);
+          post(BridgeCmd{BridgeCmdType::SET_AUTO, 0, false, 0, 0});
           needs_sync_.store(true);
-          ESP_LOGI(kTag, "FanControl rx FanMode=Off ignored (Auto-burst)");
+          return true;
+        }
+        if ((has_auto_write_ &&
+             (fm == FanControl::FanModeEnum::kOff || fm == FanControl::FanModeEnum::kLow ||
+              fm == FanControl::FanModeEnum::kMedium || fm == FanControl::FanModeEnum::kHigh ||
+              fm == FanControl::FanModeEnum::kOn)) ||
+            (fm == FanControl::FanModeEnum::kOff && ignore_next_fan_mode_off_)) {
+          ignore_next_fan_mode_off_ = false;
+          const uint8_t raw_fm = val->val.u8;
+          val->val.u8 = chip::to_underlying(FanControl::FanModeEnum::kAuto);
+          needs_sync_.store(true);
+          if (g_self != nullptr) g_self->schedule_publish();
+          ESP_LOGI(kTag, "FanControl rx burst FanMode=%u right after FanMode=Auto (ignored)", raw_fm);
           return true;
         }
         ignore_next_fan_mode_off_ = false;
         ESP_LOGI(kTag, "FanControl rx FanMode=%u", val->val.u8);
         switch (fm) {
-          case FanControl::FanModeEnum::kAuto:
-          case FanControl::FanModeEnum::kSmart:
-            last_auto_write_ms_ = now;
-            has_auto_write_ = true;
-            post(BridgeCmd{BridgeCmdType::SET_AUTO, 0, false, 0, 0});
-            needs_sync_.store(true);
-            break;
           case FanControl::FanModeEnum::kOff:
             has_auto_write_ = false;
             post(BridgeCmd{BridgeCmdType::SET_MANUAL, 0, false, 0, 0});
@@ -275,12 +284,15 @@ class AirPurifierEndpoint : public MatterEndPoint {
           return false;
         }
         if (has_auto_write_) {
-          if (val->val.u8 == 0) {
+          const uint8_t raw_ps = val->val.u8;
+          if (raw_ps == 0) {
             // fan-control-server's PostAttributeChanged calls SetFanModeToOff() synchronously.
             ignore_next_fan_mode_off_ = true;
           }
+          *val = esp_matter_nullable_uint8(nullable<uint8_t>());
           needs_sync_.store(true);
-          ESP_LOGI(kTag, "FanControl rx burst PercentSetting=%u right after FanMode=Auto", val->val.u8);
+          if (g_self != nullptr) g_self->schedule_publish();
+          ESP_LOGI(kTag, "FanControl rx burst PercentSetting=%u right after FanMode=Auto (ignored)", raw_ps);
           return true;
         }
         has_auto_write_ = false;
@@ -332,7 +344,7 @@ class AirPurifierEndpoint : public MatterEndPoint {
   }
 
  private:
-  static constexpr uint32_t kAutoBurstWindowMs = 250;
+  static constexpr uint32_t kAutoBurstWindowMs = 500;
   uint32_t last_auto_write_ms_ = 0;
   bool has_auto_write_ = false;
   bool ignore_next_fan_mode_off_ = false;
@@ -1105,6 +1117,10 @@ void MatterHaBridge::publish(const StatusSnapshot& s) {
     }
   }
   // Never block the loop on the CHIP lock: hand the update to the CHIP task.
+  schedule_publish();
+}
+
+void MatterHaBridge::schedule_publish() {
   if (started_ && !g_work_scheduled.exchange(true)) {
     if (chip::DeviceLayer::PlatformMgr().ScheduleWork(publish_work, reinterpret_cast<intptr_t>(this)) != CHIP_NO_ERROR) {
       g_work_scheduled = false;

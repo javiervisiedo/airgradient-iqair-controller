@@ -114,6 +114,7 @@ class MatterHaBridge {
 
   // Main loop: publish status to REST readers and Matter attributes.
   void publish(const StatusSnapshot& s);
+  void schedule_publish();
 
   bool commissioned() const;   // cached, updated in the CHIP context
   int fabric_count() const;    // cached, updated in the CHIP context
