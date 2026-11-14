@@ -657,6 +657,10 @@ void setup() {
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   ESP_LOGW(kTag, "using compiled-in Wi-Fi credentials (secrets.h)");
 #endif
+#else
+  // Matter's ConnectivityManagerImpl owns STA association/reconnect when Wi-Fi is
+  // provisioned over BLE; disable Arduino STA auto-reconnect so it cannot fight it.
+  WiFi.setAutoReconnect(false);
 #endif
 
   esp_task_wdt_reset();

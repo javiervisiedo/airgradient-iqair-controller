@@ -109,6 +109,19 @@ std::atomic<int> g_fabrics{0};
 std::atomic<bool> g_ota_busy{false};
 std::atomic<bool> g_matter_utc_synced{false};
 MatterHaBridge* g_self = nullptr;
+constexpr uint32_t kOnboardingReprintMs = 30000;
+char g_onboarding_code[24] = "";
+char g_onboarding_qr[160] = "";
+uint32_t g_last_onboarding_print_ms = 0;
+
+void print_onboarding_banner() {
+  if (g_onboarding_code[0] == '\0') return;
+  Serial.println();
+  Serial.println("==== Matter commissioning (Apple Home / Google Home) ====");
+  Serial.printf("Manual pairing code: %s\n", g_onboarding_code);
+  Serial.printf("QR code URL:         %s\n", g_onboarding_qr);
+  Serial.println("=========================================================");
+}
 
 class TimeSyncDelegate : public chip::app::Clusters::TimeSynchronization::DefaultTimeSyncDelegate {
  public:
@@ -756,11 +769,10 @@ bool MatterHaBridge::begin(AppConfig* cfg, SemaphoreHandle_t cfg_mutex, QueueHan
   g_commissioned = Matter.isDeviceCommissioned();
 
   if (!Matter.isDeviceCommissioned()) {
-    Serial.println();
-    Serial.println("==== Matter commissioning (Apple Home / Google Home) ====");
-    Serial.printf("Manual pairing code: %s\n", Matter.getManualPairingCode().c_str());
-    Serial.printf("QR code URL:         %s\n", Matter.getOnboardingQRCodeUrl().c_str());
-    Serial.println("=========================================================");
+    snprintf(g_onboarding_code, sizeof(g_onboarding_code), "%s", Matter.getManualPairingCode().c_str());
+    snprintf(g_onboarding_qr, sizeof(g_onboarding_qr), "%s", Matter.getOnboardingQRCodeUrl().c_str());
+    g_last_onboarding_print_ms = millis();
+    print_onboarding_banner();
   } else {
     ESP_LOGI(kTag, "Matter commissioned");
   }
@@ -832,6 +844,13 @@ void MatterHaBridge::publish(const StatusSnapshot& s) {
   status_ = s;
   matter_pending_ = s;
   xSemaphoreGive(status_mutex_);
+  if (!g_commissioned.load() && g_onboarding_code[0] != '\0') {
+    const uint32_t now = millis();
+    if (now - g_last_onboarding_print_ms >= kOnboardingReprintMs) {
+      g_last_onboarding_print_ms = now;
+      print_onboarding_banner();
+    }
+  }
   // Never block the loop on the CHIP lock: hand the update to the CHIP task.
   if (started_ && !g_work_scheduled.exchange(true)) {
     if (chip::DeviceLayer::PlatformMgr().ScheduleWork(publish_work, reinterpret_cast<intptr_t>(this)) != CHIP_NO_ERROR) {
