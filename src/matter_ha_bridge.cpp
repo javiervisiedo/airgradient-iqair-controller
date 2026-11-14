@@ -698,6 +698,7 @@ bool MatterHaBridge::begin(AppConfig* cfg, SemaphoreHandle_t cfg_mutex, QueueHan
   status_mutex_ = xSemaphoreCreateMutex();
   if (auth_mutex_ == nullptr) auth_mutex_ = xSemaphoreCreateMutex();
 
+  Matter.selectNetwork(MATTER_NETWORK_WIFI);
   Matter.setVendorName("DIY");
   Matter.setProductName("AtomS3 IAQ Purifier Controller");
   Matter.setBLEMemoryReleaseEnabled(true);  // library releases BLE RAM safely after commissioning

@@ -14,6 +14,7 @@
 #include <esp_log.h>
 #include <esp_ota_ops.h>
 #include <esp_task_wdt.h>
+#include <esp_wifi.h>
 
 #include <atomic>
 
@@ -619,15 +620,36 @@ void setup() {
   command_purifier(g_core.begin(g_cfg, millis()));
   g_loop_cfg = g_cfg;
 
+  // Initialize Wi-Fi in STA-only mode using Matter's compact buffer budget before
+  // WiFi.mode(WIFI_STA) / Matter.begin():
+  //  - First esp_wifi_init() owns the buffer counts (~30 KB less SRAM than Arduino defaults).
+  //  - Always calling WiFi.mode(WIFI_STA) ensures Arduino Wi-Fi events work under CHIPoBLE
+  //    provisioning and clears any stale WIFI_MODE_AP/APSTA left in NVS so Matter never
+  //    triggers wifi_softap_start() / ieee80211_hostap_attach().
+  {
+    wifi_mode_t cur = WIFI_MODE_NULL;
+    if (esp_wifi_get_mode(&cur) == ESP_ERR_WIFI_NOT_INIT) {
+      wifi_init_config_t wcfg = WIFI_INIT_CONFIG_DEFAULT();
+      wcfg.static_rx_buf_num = 4;
+      wcfg.dynamic_rx_buf_num = 8;
+      wcfg.tx_buf_type = 1;
+      wcfg.static_tx_buf_num = 0;
+      wcfg.dynamic_tx_buf_num = 8;
+      if (wcfg.cache_tx_buf_num < 4) wcfg.cache_tx_buf_num = 4;
+      wcfg.rx_ba_win = 6;
+      const esp_err_t werr = esp_wifi_init(&wcfg);
+      if (werr != ESP_OK) ESP_LOGW(kTag, "esp_wifi_init: %s", esp_err_to_name(werr));
+    }
+  }
   // Network stack before SNTP setup (tier 1 must be armed before DHCP).
   Network.begin();
   WiFi.onEvent(on_wifi_event);
+  WiFi.mode(WIFI_STA);
   g_clock.begin(g_cfg.tz_posix);
   g_ag.begin();
 
 #if defined(WIFI_SSID) && defined(WIFI_PASSWORD)
   // Optional dev/simulation credentials; Matter can still commission on-network.
-  WiFi.mode(WIFI_STA);
 #ifdef WOKWI_SIM
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD, 6);  // Wokwi-GUEST is on channel 6
   ESP_LOGI(kTag, "using simulation Wi-Fi (%s)", WIFI_SSID);
