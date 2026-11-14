@@ -94,7 +94,7 @@ constexpr int kOtaRecvRetries = 3;           // extra httpd_req_recv timeouts to
 constexpr uint16_t kHttpRecvTimeoutS = 3;    // per-recv socket timeout (bounds slow clients)
 constexpr uint16_t kHttpSendTimeoutS = 3;
 constexpr uint16_t kHttpCtrlPort = 32790;    // must not clash with Matter (5540) or other services
-constexpr size_t kHttpStackBytes = 8192;     // headroom for OTA flash writes
+constexpr size_t kHttpStackBytes = 6144;     // REST + OTA flash writes (large buffers are heap-allocated)
 constexpr uint16_t kHttpMaxSockets = 4;
 constexpr uint16_t kHttpMaxUriHandlers = 8;
 
@@ -267,11 +267,14 @@ bool post(const BridgeCmd& c, TickType_t wait = 0) {
 }
 
 // ---------------------------------------------------------------------------
-// REST API
+// REST API (buffers allocated only once start_http() starts httpd after IP)
 // ---------------------------------------------------------------------------
-alignas(8) uint8_t g_http_arena[8192];   // httpd runs a single task: one arena is enough
-char g_http_out[2560];
-char g_http_body[kMaxBody + 1];
+struct HttpBuffers {
+  alignas(8) uint8_t arena[4096];
+  char out[2048];
+  char body[kMaxBody + 1];
+};
+HttpBuffers* g_http = nullptr;
 
 void put_num(JsonObject o, const char* k, float v, int decimals) {
   if (isnan(v)) {
@@ -290,15 +293,15 @@ esp_err_t send_json(httpd_req_t* req, const char* status, const char* body, size
 }
 
 esp_err_t send_error(httpd_req_t* req, const char* status, const char* msg) {
-  JsonArena arena(g_http_arena, sizeof(g_http_arena));
+  JsonArena arena(g_http->arena, sizeof(g_http->arena));
   size_t n = 0;
   {
     JsonDocument doc(&arena);
     doc["error"] = msg;
-    n = serializeJson(doc, g_http_out, sizeof(g_http_out));
+    n = serializeJson(doc, g_http->out, sizeof(g_http->out));
   }
   arena.reset();
-  return send_json(req, status, g_http_out, n);
+  return send_json(req, status, g_http->out, n);
 }
 
 // After an early rejection the request body may be unread. Returning ESP_FAIL
@@ -353,12 +356,12 @@ Body read_body(httpd_req_t* req, size_t* len) {
   size_t got = 0;
   int timeouts = 0;
   while (got < req->content_len) {
-    const int r = httpd_req_recv(req, g_http_body + got, req->content_len - got);
+    const int r = httpd_req_recv(req, g_http->body + got, req->content_len - got);
     if (r == HTTPD_SOCK_ERR_TIMEOUT && ++timeouts <= kBodyRecvRetries) continue;  // bounded
     if (r <= 0) return Body::IO_ERROR;
     got += static_cast<size_t>(r);
   }
-  g_http_body[got] = '\0';
+  g_http->body[got] = '\0';
   *len = got;
   return Body::OK;
 }
@@ -376,7 +379,7 @@ bool read_body_or_reject(httpd_req_t* req, size_t* len, esp_err_t* ret) {
 esp_err_t h_status(httpd_req_t* req) {
   StatusSnapshot s;
   g_self->copy_status(&s);
-  JsonArena arena(g_http_arena, sizeof(g_http_arena));
+  JsonArena arena(g_http->arena, sizeof(g_http->arena));
   size_t n = 0;
   {
     JsonDocument doc(&arena);
@@ -420,11 +423,11 @@ esp_err_t h_status(httpd_req_t* req) {
     doc["min_free_heap_bytes"] = s.min_free_heap_bytes;
     doc["uptime_s"] = s.uptime_s;
     doc["ir_frames_sent"] = s.ir_frames_sent;
-    n = doc.overflowed() ? 0 : serializeJson(doc, g_http_out, sizeof(g_http_out));
+    n = doc.overflowed() ? 0 : serializeJson(doc, g_http->out, sizeof(g_http->out));
   }
   arena.reset();
-  if (n == 0 || n >= sizeof(g_http_out)) return send_error(req, "500 Internal Server Error", "status overflow");
-  return send_json(req, "200 OK", g_http_out, n);
+  if (n == 0 || n >= sizeof(g_http->out)) return send_error(req, "500 Internal Server Error", "status overflow");
+  return send_json(req, "200 OK", g_http->out, n);
 }
 
 esp_err_t h_config_get(httpd_req_t* req) {
@@ -432,9 +435,9 @@ esp_err_t h_config_get(httpd_req_t* req) {
   xSemaphoreTake(g_self->config_mutex(), portMAX_DELAY);
   copy = *g_self->config();
   xSemaphoreGive(g_self->config_mutex());
-  const size_t n = config_to_json(copy, g_http_out, sizeof(g_http_out));
+  const size_t n = config_to_json(copy, g_http->out, sizeof(g_http->out));
   if (n == 0) return send_error(req, "500 Internal Server Error", "config overflow");
-  return send_json(req, "200 OK", g_http_out, n);
+  return send_json(req, "200 OK", g_http->out, n);
 }
 
 esp_err_t h_config_patch(httpd_req_t* req) {
@@ -450,7 +453,7 @@ esp_err_t h_config_patch(httpd_req_t* req) {
   xSemaphoreTake(g_self->config_mutex(), portMAX_DELAY);
   previous = *g_self->config();
   copy = previous;
-  ok = config_apply_json_patch(&copy, g_http_body, len, &mask, err, sizeof(err));
+  ok = config_apply_json_patch(&copy, g_http->body, len, &mask, err, sizeof(err));
   BridgeCmd cmd{BridgeCmdType::CONFIG_PATCHED, copy.manual_speed, false, mask,
                 static_cast<uint8_t>(copy.operating_mode)};
   if (ok) {
@@ -471,9 +474,9 @@ esp_err_t h_config_patch(httpd_req_t* req) {
     xSemaphoreGive(g_self->config_mutex());
     return send_error(req, "503 Service Unavailable", "busy, not applied; retry");
   }
-  const size_t n = config_to_json(copy, g_http_out, sizeof(g_http_out));
+  const size_t n = config_to_json(copy, g_http->out, sizeof(g_http->out));
   if (n == 0) return send_error(req, "500 Internal Server Error", "config overflow");
-  return send_json(req, "200 OK", g_http_out, n);
+  return send_json(req, "200 OK", g_http->out, n);
 }
 
 esp_err_t h_command(httpd_req_t* req) {
@@ -483,10 +486,10 @@ esp_err_t h_command(httpd_req_t* req) {
   if (!read_body_or_reject(req, &len, &ret)) return ret;
   BridgeCmd cmd{BridgeCmdType::SET_AUTO, 0, false, 0, 0};
   const char* error = nullptr;
-  JsonArena arena(g_http_arena, sizeof(g_http_arena));
+  JsonArena arena(g_http->arena, sizeof(g_http->arena));
   {
     JsonDocument doc(&arena);
-    if (deserializeJson(doc, g_http_body, len) || !doc.is<JsonObject>()) {
+    if (deserializeJson(doc, g_http->body, len) || !doc.is<JsonObject>()) {
       error = "invalid JSON";
     } else {
       const char* action = doc["action"] | "";
@@ -555,7 +558,7 @@ esp_err_t h_root(httpd_req_t* req) {
   return send_json(req, "200 OK", kIdx, sizeof(kIdx) - 1);
 }
 
-uint8_t g_ota_buf[4096];  // httpd runs a single task; kept out of task stack
+constexpr size_t kOtaChunkBytes = 2048;
 
 esp_err_t h_ota(httpd_req_t* req) {
   if (g_self->auth_require(req) != 0) return finish_unread(req);  // 401 / 429 already sent
@@ -565,7 +568,9 @@ esp_err_t h_ota(httpd_req_t* req) {
   }
   struct BusyGuard {
     bool keep = false;
+    uint8_t* buf = nullptr;
     ~BusyGuard() {
+      free(buf);
       if (!keep) g_ota_busy = false;
     }
   } busy_guard;
@@ -587,6 +592,12 @@ esp_err_t h_ota(httpd_req_t* req) {
     return reject(req, "413 Payload Too Large", "firmware exceeds OTA partition size");
   }
 
+  busy_guard.buf = static_cast<uint8_t*>(malloc(kOtaChunkBytes));
+  if (busy_guard.buf == nullptr) {
+    return reject(req, "503 Service Unavailable", "low memory for OTA buffer");
+  }
+  uint8_t* ota_buf = busy_guard.buf;
+
   esp_ota_handle_t handle = 0;
   bool ota_started = false;
   size_t remaining = req->content_len;
@@ -596,10 +607,10 @@ esp_err_t h_ota(httpd_req_t* req) {
   size_t next_log_pct = 25;
 
   while (remaining > 0) {
-    const size_t space = !ota_started ? (sizeof(g_ota_buf) - ota_buf_used) : sizeof(g_ota_buf);
+    const size_t space = !ota_started ? (kOtaChunkBytes - ota_buf_used) : kOtaChunkBytes;
     const size_t to_read = remaining < space ? remaining : space;
-    char* dst = !ota_started ? reinterpret_cast<char*>(g_ota_buf + ota_buf_used)
-                             : reinterpret_cast<char*>(g_ota_buf);
+    char* dst = !ota_started ? reinterpret_cast<char*>(ota_buf + ota_buf_used)
+                             : reinterpret_cast<char*>(ota_buf);
     const int r = httpd_req_recv(req, dst, to_read);
     if (r == HTTPD_SOCK_ERR_TIMEOUT) {
       if (++timeouts <= kOtaRecvRetries) {
@@ -628,14 +639,14 @@ esp_err_t h_ota(httpd_req_t* req) {
       ota_buf_used += static_cast<size_t>(r);
       static_assert(kOtaImageMagic == ESP_IMAGE_HEADER_MAGIC, "OTA magic mismatch");
       static_assert(kOtaChipIdEsp32S3 == ESP_CHIP_ID_ESP32S3, "OTA chip_id mismatch");
-      if (ota_buf_used >= 1 && g_ota_buf[0] != kOtaImageMagic) {
-        ESP_LOGW(kTag, "OTA rejected: invalid image magic (0x%02X)", g_ota_buf[0]);
+      if (ota_buf_used >= 1 && ota_buf[0] != kOtaImageMagic) {
+        ESP_LOGW(kTag, "OTA rejected: invalid image magic (0x%02X)", ota_buf[0]);
         return reject(req, "400 Bad Request", "invalid firmware image header");
       }
       if (ota_buf_used < kOtaHeaderBytes) continue;
-      if (!ota_header_is_valid(g_ota_buf, ota_buf_used)) {
+      if (!ota_header_is_valid(ota_buf, ota_buf_used)) {
         const uint16_t cid =
-            static_cast<uint16_t>(g_ota_buf[12]) | (static_cast<uint16_t>(g_ota_buf[13]) << 8);
+            static_cast<uint16_t>(ota_buf[12]) | (static_cast<uint16_t>(ota_buf[13]) << 8);
         ESP_LOGW(kTag, "OTA rejected: wrong chip_id (0x%04X)", cid);
         return reject(req, "400 Bad Request", "firmware image is not for ESP32-S3");
       }
@@ -650,7 +661,7 @@ esp_err_t h_ota(httpd_req_t* req) {
                static_cast<unsigned>(req->content_len), part->label);
     }
 
-    const esp_err_t werr = esp_ota_write(handle, g_ota_buf, write_len);
+    const esp_err_t werr = esp_ota_write(handle, ota_buf, write_len);
     if (werr != ESP_OK) {
       ESP_LOGE(kTag, "esp_ota_write failed at %u: %s", static_cast<unsigned>(received), esp_err_to_name(werr));
       esp_ota_abort(handle);
@@ -781,6 +792,13 @@ bool MatterHaBridge::begin(AppConfig* cfg, SemaphoreHandle_t cfg_mutex, QueueHan
 
 bool MatterHaBridge::start_http() {
   if (httpd_ != nullptr) return true;
+  if (g_http == nullptr) {
+    g_http = static_cast<HttpBuffers*>(calloc(1, sizeof(HttpBuffers)));
+    if (g_http == nullptr) {
+      ESP_LOGE(kTag, "no heap for HTTP buffers (free=%u)", static_cast<unsigned>(esp_get_free_heap_size()));
+      return false;
+    }
+  }
   httpd_config_t c = HTTPD_DEFAULT_CONFIG();
   c.server_port = 80;
   c.ctrl_port = kHttpCtrlPort;

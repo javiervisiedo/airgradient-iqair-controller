@@ -9,9 +9,13 @@
 // Both loop and net are registered with the 15 s task watchdog.
 #include <Arduino.h>
 #include <Network.h>
+#if defined(WIFI_SSID) && defined(WIFI_PASSWORD)
 #include <WiFi.h>
+#endif
+#include <esp_event.h>
 #include <esp_heap_caps.h>
 #include <esp_log.h>
+#include <esp_netif.h>
 #include <esp_ota_ops.h>
 #include <esp_task_wdt.h>
 #include <esp_wifi.h>
@@ -74,6 +78,7 @@ MatterHaBridge g_bridge;
 // Wi-Fi events -> net task
 enum class WifiEvent : uint8_t { NONE = 0, DISCONNECTED = 1, GOT_IP = 2 };
 std::atomic<uint8_t> g_wifi_ev{static_cast<uint8_t>(WifiEvent::NONE)};
+std::atomic<bool> g_wifi_connected{false};
 std::atomic<uint32_t> g_gateway_ip{0};
 std::atomic<uint32_t> g_local_ip{0};
 std::atomic<bool> g_ag_invalidate{false};  // set by loop, consumed by net task
@@ -393,7 +398,12 @@ void publish_status(uint32_t now) {
   s.matter_commissioned = g_bridge.commissioned();
   s.matter_fabrics_count = s.matter_commissioned ? g_bridge.fabric_count() : 0;
   s.speed_changes_today = g_core.speed_changes_today();
-  s.wifi_rssi_dbm = WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : 0;
+  if (g_wifi_connected.load()) {
+    wifi_ap_record_t ap = {};
+    s.wifi_rssi_dbm = esp_wifi_sta_get_ap_info(&ap) == ESP_OK ? ap.rssi : 0;
+  } else {
+    s.wifi_rssi_dbm = 0;
+  }
   s.free_heap_bytes = esp_get_free_heap_size();
   s.min_free_heap_bytes = esp_get_minimum_free_heap_size();
   s.uptime_s = now / 1000;
@@ -472,7 +482,7 @@ void net_task(void*) {
 #else
     const bool allow_http_poll = true;
 #endif
-    if (allow_http_poll && (first_poll ? (WiFi.status() == WL_CONNECTED) : (now - last_poll >= interval))) {
+    if (allow_http_poll && (first_poll ? g_wifi_connected.load() : (now - last_poll >= interval))) {
       first_poll = false;
       last_poll = now;
       PollResult pr = {};
@@ -503,18 +513,20 @@ void net_task(void*) {
   }
 }
 
-void on_wifi_event(arduino_event_id_t event, arduino_event_info_t info) {
-  switch (event) {
-    case ARDUINO_EVENT_WIFI_STA_GOT_IP:
-      g_local_ip.store(info.got_ip.ip_info.ip.addr);
-      g_gateway_ip.store(info.got_ip.ip_info.gw.addr);
-      g_wifi_ev.store(static_cast<uint8_t>(WifiEvent::GOT_IP));
-      break;
-    case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
-      g_wifi_ev.store(static_cast<uint8_t>(WifiEvent::DISCONNECTED));
-      break;
-    default:
-      break;
+void on_esp_ip_event(void*, esp_event_base_t, int32_t event_id, void* event_data) {
+  if (event_id == IP_EVENT_STA_GOT_IP && event_data != nullptr) {
+    const auto* e = static_cast<const ip_event_got_ip_t*>(event_data);
+    g_local_ip.store(e->ip_info.ip.addr);
+    g_gateway_ip.store(e->ip_info.gw.addr);
+    g_wifi_connected.store(true);
+    g_wifi_ev.store(static_cast<uint8_t>(WifiEvent::GOT_IP));
+  }
+}
+
+void on_esp_wifi_event(void*, esp_event_base_t, int32_t event_id, void*) {
+  if (event_id == WIFI_EVENT_STA_DISCONNECTED) {
+    g_wifi_connected.store(false);
+    g_wifi_ev.store(static_cast<uint8_t>(WifiEvent::DISCONNECTED));
   }
 }
 
@@ -620,12 +632,13 @@ void setup() {
   command_purifier(g_core.begin(g_cfg, millis()));
   g_loop_cfg = g_cfg;
 
-  // Initialize Wi-Fi in STA-only mode using Matter's compact buffer budget before
-  // WiFi.mode(WIFI_STA) / Matter.begin():
+  // Pre-init Wi-Fi in STA-only mode using Matter's compact buffer budget:
   //  - First esp_wifi_init() owns the buffer counts (~30 KB less SRAM than Arduino defaults).
-  //  - Always calling WiFi.mode(WIFI_STA) ensures Arduino Wi-Fi events work under CHIPoBLE
-  //    provisioning and clears any stale WIFI_MODE_AP/APSTA left in NVS so Matter never
-  //    triggers wifi_softap_start() / ieee80211_hostap_attach().
+  //  - esp_wifi_set_mode(WIFI_MODE_STA) clears any stale SoftAP mode saved in NVS so
+  //    Matter's EnableStationMode() never triggers wifi_softap_start() / hostap crash.
+  //  - Without secrets.h, skip WiFi.mode(WIFI_STA) so Arduino doesn't allocate an unused
+  //    WIFI_AP_DEF netif or start Wi-Fi early alongside NimBLE + Matter initialization.
+  Network.begin();
   {
     wifi_mode_t cur = WIFI_MODE_NULL;
     if (esp_wifi_get_mode(&cur) == ESP_ERR_WIFI_NOT_INIT) {
@@ -640,16 +653,16 @@ void setup() {
       const esp_err_t werr = esp_wifi_init(&wcfg);
       if (werr != ESP_OK) ESP_LOGW(kTag, "esp_wifi_init: %s", esp_err_to_name(werr));
     }
+    esp_wifi_set_mode(WIFI_MODE_STA);
   }
-  // Network stack before SNTP setup (tier 1 must be armed before DHCP).
-  Network.begin();
-  WiFi.onEvent(on_wifi_event);
-  WiFi.mode(WIFI_STA);
+  esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &on_esp_ip_event, nullptr, nullptr);
+  esp_event_handler_instance_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, &on_esp_wifi_event, nullptr, nullptr);
   g_clock.begin(g_cfg.tz_posix);
   g_ag.begin();
 
 #if defined(WIFI_SSID) && defined(WIFI_PASSWORD)
   // Optional dev/simulation credentials; Matter can still commission on-network.
+  WiFi.mode(WIFI_STA);
 #ifdef WOKWI_SIM
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD, 6);  // Wokwi-GUEST is on channel 6
   ESP_LOGI(kTag, "using simulation Wi-Fi (%s)", WIFI_SSID);
@@ -657,15 +670,15 @@ void setup() {
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   ESP_LOGW(kTag, "using compiled-in Wi-Fi credentials (secrets.h)");
 #endif
-#else
-  // Matter's ConnectivityManagerImpl owns STA association/reconnect when Wi-Fi is
-  // provisioned over BLE; disable Arduino STA auto-reconnect so it cannot fight it.
-  WiFi.setAutoReconnect(false);
 #endif
 
   esp_task_wdt_reset();
+  ESP_LOGI(kTag, "before bridge init, heap=%u", static_cast<unsigned>(esp_get_free_heap_size()));
   const bool bridge_ok = g_bridge.begin(&g_cfg, g_cfg_mutex, g_cmd_q);
   if (!bridge_ok) ESP_LOGE(kTag, "Matter bridge init failed");
+  ESP_LOGI(kTag, "after bridge init, heap=%u (min=%u)",
+           static_cast<unsigned>(esp_get_free_heap_size()),
+           static_cast<unsigned>(esp_get_minimum_free_heap_size()));
   {
     char token[auth::kTokenChars + 1];
     state_load_api_token(token, sizeof(token));  // empty if never paired
@@ -693,7 +706,7 @@ void setup() {
   }
 
   g_boot_ms = millis();
-  xTaskCreatePinnedToCore(net_task, "net", 8192, nullptr, 2, nullptr, 0);
+  xTaskCreatePinnedToCore(net_task, "net", 6144, nullptr, 2, nullptr, 0);
   ESP_LOGI(kTag, "setup done, heap=%u", static_cast<unsigned>(esp_get_free_heap_size()));
 }
 
@@ -746,7 +759,7 @@ void loop() {
   li.pair_hold_ready = gesture_hold && !li.factory_reset_warning && now - g_btn_down_ms >= kPairHoldMinMs;
   li.pairing_active = g_bridge.auth_pairing_open(now);
   li.sensor_alarm = g_core.fault().alarm();
-  li.wifi_connected = WiFi.status() == WL_CONNECTED;
+  li.wifi_connected = g_wifi_connected.load();
   li.matter_commissioned = g_bridge.commissioned();
   li.ag_fail_count = g_core.fault().fail_count();
   li.ir_flash_active = g_ir_flash_active;

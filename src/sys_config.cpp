@@ -14,7 +14,7 @@ namespace {
 const char* const kCodeKeys[kNumSpeeds] = {"off", "speed_1", "speed_2", "speed_3",
                                            "speed_4", "speed_5", "speed_6"};
 
-alignas(8) uint8_t g_cfg_json_buf[6144];  // config JSON work area
+alignas(8) uint8_t g_cfg_json_buf[3072];  // config JSON work area (2x kMaxBody)
 std::recursive_mutex g_buf_mutex;        // guards all static buffers in this file (httpd + loop tasks)
 
 void set_err(char* err, size_t len, const char* msg) {
@@ -317,8 +317,7 @@ constexpr const char* kNvsKeyCfg = "cfg";
 constexpr const char* kNvsKeyAgIp = "ag_ip";
 constexpr const char* kCfgPath = "/config.json";
 bool g_fs_ok = false;
-char g_io_buf[1536];
-char g_io_buf2[1536];
+char g_io_buf[1024];
 
 bool load_from_text(AppConfig* cfg, const char* text, size_t len, const char* src) {
   AppConfig tmp;
@@ -377,8 +376,10 @@ bool config_save(const AppConfig& cfg) {
   bool changed = true;
   Preferences p;
   if (p.begin(kNvsNs, false)) {
-    const size_t m = p.getString(kNvsKeyCfg, g_io_buf2, sizeof(g_io_buf2));
-    changed = (m == 0 || strcmp(g_io_buf, g_io_buf2) != 0);
+    // config_to_json() above has finished using g_cfg_json_buf (3072 B) under g_buf_mutex.
+    char* prev_buf = reinterpret_cast<char*>(g_cfg_json_buf);
+    const size_t m = p.getString(kNvsKeyCfg, prev_buf, sizeof(g_io_buf));
+    changed = (m == 0 || strcmp(g_io_buf, prev_buf) != 0);
     if (changed) ok = p.putString(kNvsKeyCfg, g_io_buf) == n;  // write only on change (flash wear)
     p.end();
   } else {

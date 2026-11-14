@@ -2,6 +2,7 @@
 #include "ag_client.h"
 
 #include <math.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include <initializer_list>
@@ -11,8 +12,6 @@
 namespace ag {
 
 namespace {
-alignas(8) uint8_t g_parse_arena[4096];  // sized with ARDUINOJSON_POOL_CAPACITY=64 (platformio.ini)
-
 bool read_num(JsonVariantConst v, float lo, float hi, float* out) {
   if (v.isNull() || !v.is<float>()) return false;  // is<float>() accepts integers too
   const float f = v.as<float>();
@@ -34,7 +33,15 @@ const char* parse_result_to_str(ParseResult r) {
 ParseResult parse_measures(const char* json, size_t len, const char* expected_serial, Measurement* out) {
   Measurement m;
   ParseResult res = ParseResult::OK;
-  JsonArena arena(g_parse_arena, sizeof(g_parse_arena));
+  // Transient 4 KB arena: single allocation prevents node fragmentation during polls
+  // while keeping 0 B in .bss during Matter + NimBLE boot.
+  constexpr size_t kArenaBytes = 4096;
+  uint8_t* arena_mem = static_cast<uint8_t*>(malloc(kArenaBytes));
+  if (arena_mem == nullptr) {
+    *out = m;
+    return ParseResult::BAD_JSON;
+  }
+  JsonArena arena(arena_mem, kArenaBytes);
   {
     // Only the keys used below are kept, so a larger payload from newer monitor
     // firmware cannot exhaust the static arena.
@@ -70,6 +77,7 @@ ParseResult parse_measures(const char* json, size_t len, const char* expected_se
     }
   }
   arena.reset();
+  free(arena_mem);
   *out = m;
   return res;
 }
@@ -89,11 +97,12 @@ bool StaleDetector::update(const Measurement& m) {
 }  // namespace ag
 
 #ifndef UNIT_TEST
-#include <WiFi.h>
+#include <IPAddress.h>
 #include <mdns.h>
 #include <esp_http_client.h>
 #include <esp_log.h>
 #include <esp_task_wdt.h>
+#include <esp_wifi.h>
 #include <lwip/inet.h>
 
 #include "clock_sync.h"
@@ -104,7 +113,15 @@ constexpr uint32_t kHostTimeoutMs = 3000;
 constexpr uint32_t kCachedTimeoutMs = 2500;   // SRS §2.2 step 2
 constexpr uint32_t kMdnsTimeoutMs = 2000;     // SRS §2.2 step 3
 constexpr int kMaxScanCandidates = 4;
-char g_body[2048];
+constexpr size_t kMaxAgBodyBytes = 2048;
+
+struct ScopedBuf {
+  char* ptr;
+  explicit ScopedBuf(size_t n) : ptr(static_cast<char*>(malloc(n))) {}
+  ~ScopedBuf() { free(ptr); }
+  ScopedBuf(const ScopedBuf&) = delete;
+  ScopedBuf& operator=(const ScopedBuf&) = delete;
+};
 
 void ip_to_str(uint32_t ip, char* out, size_t len) {
   snprintf(out, len, "%u.%u.%u.%u", ip & 0xFF, (ip >> 8) & 0xFF, (ip >> 16) & 0xFF, (ip >> 24) & 0xFF);
@@ -147,6 +164,8 @@ void AgClient::remember(uint32_t ip) {
 
 bool AgClient::fetch(const char* host, uint32_t timeout_ms, const char* serial, ag::Measurement* out,
                      const char* host_header) {
+  ScopedBuf body(kMaxAgBodyBytes);
+  if (body.ptr == nullptr) return false;
   char url[96];
   snprintf(url, sizeof(url), "http://%s/measures/current", host);
   esp_http_client_config_t cfg = {};
@@ -167,13 +186,13 @@ bool AgClient::fetch(const char* host, uint32_t timeout_ms, const char* serial, 
     last_http_ = esp_http_client_get_status_code(c);
     if (last_http_ == 200) {
       int total = 0;
-      while (total < static_cast<int>(sizeof(g_body)) - 1) {
-        const int n = esp_http_client_read(c, g_body + total, sizeof(g_body) - 1 - total);
+      while (total < static_cast<int>(kMaxAgBodyBytes) - 1) {
+        const int n = esp_http_client_read(c, body.ptr + total, static_cast<int>(kMaxAgBodyBytes) - 1 - total);
         if (n <= 0) break;
         total += n;
       }
-      g_body[total] = '\0';
-      last_parse_ = ag::parse_measures(g_body, static_cast<size_t>(total), serial, out);
+      body.ptr[total] = '\0';
+      last_parse_ = ag::parse_measures(body.ptr, static_cast<size_t>(total), serial, out);
       ok = last_parse_ == ag::ParseResult::OK;
       if (!ok) ESP_LOGW(kTag, "%s: %s", url, ag::parse_result_to_str(last_parse_));
     } else {
@@ -195,7 +214,8 @@ bool AgClient::try_ip(uint32_t ip, uint32_t timeout_ms, const char* serial, ag::
 }
 
 bool AgClient::poll(const AppConfig& cfg, ag::Measurement* out) {
-  if (WiFi.status() != WL_CONNECTED) {
+  wifi_ap_record_t ap = {};
+  if (esp_wifi_sta_get_ap_info(&ap) != ESP_OK) {
     source_ = Source::NONE;
     return false;
   }
