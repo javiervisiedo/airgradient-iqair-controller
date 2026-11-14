@@ -104,6 +104,8 @@ class MatterHaBridge {
   // Starts the REST server (call once the network stack is up; idempotent).
   bool start_http();
   bool http_started() const { return http_started_.load(); }
+  bool commissioning_active() const { return commissioning_active_.load(); }
+  bool ble_released() const { return ble_released_.load(); }
   void request_reboot() { reboot_requested_.store(true); }
   bool take_reboot_request() { return reboot_requested_.exchange(false); }
   // Registers atoms3-iaq.local (+ _http._tcp) as an mDNS delegate host so the
@@ -159,6 +161,8 @@ class MatterHaBridge {
   StatusSnapshot matter_pending_;
   bool started_ = false;
   std::atomic<bool> http_started_{false};
+  std::atomic<bool> commissioning_active_{false};
+  std::atomic<bool> ble_released_{false};
   std::atomic<bool> reboot_requested_{false};
   std::atomic<bool> auth_unsaved_{false};
   void* httpd_ = nullptr;

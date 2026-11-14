@@ -62,8 +62,10 @@ bool ota_header_is_valid(const uint8_t* data, size_t len) {
 
 #ifndef UNIT_TEST
 #include <Matter.h>
+#include <app/clusters/air-quality-server/air-quality-server.h>
 #include <app/clusters/time-synchronization-server/DefaultTimeSyncDelegate.h>
 #include <app/server/Server.h>
+#include <app/util/attribute-storage.h>
 #include <esp_app_format.h>
 #include <esp_http_server.h>
 #include <esp_log.h>
@@ -78,6 +80,7 @@ bool ota_header_is_valid(const uint8_t* data, size_t len) {
 
 #include <atomic>
 #include <errno.h>
+#include <new>
 
 #include "clock_sync.h"
 #include "iaq_algorithm.h"
@@ -108,6 +111,8 @@ std::atomic<bool> g_commissioned{false};
 std::atomic<int> g_fabrics{0};
 std::atomic<bool> g_ota_busy{false};
 std::atomic<bool> g_matter_utc_synced{false};
+std::atomic<int64_t> g_matter_utc_unix{0};
+std::atomic<uint32_t> g_matter_utc_set_ms{0};
 MatterHaBridge* g_self = nullptr;
 constexpr uint32_t kOnboardingReprintMs = 30000;
 char g_onboarding_code[24] = "";
@@ -134,6 +139,8 @@ class TimeSyncDelegate : public chip::app::Clusters::TimeSynchronization::Defaul
   void UTCTimeAvailabilityChanged(uint64_t utc_us) override {
     const time_t unix_s = clk::matter_utc_us_to_unix(utc_us);
     if (unix_s >= clk::kValidEpoch) {
+      g_matter_utc_unix.store(static_cast<int64_t>(unix_s));
+      g_matter_utc_set_ms.store(millis());
       g_matter_utc_synced = true;
       ESP_LOGI(kTag, "Matter TimeSynchronization UTCTime updated (unix=%lld)", static_cast<long long>(unix_s));
     } else {
@@ -252,7 +259,30 @@ class AirQualityEndpoint : public MatterEndPoint {
     return updateAttributeVal(RelativeHumidityMeasurement::Id,
                               RelativeHumidityMeasurement::Attributes::MeasuredValue::Id, &val);
   }
+  bool set_air_quality(uint8_t v) {
+    if (aq_inst_ == nullptr) {
+      if (!emberAfContainsServer(getEndPointId(), AirQuality::Id)) {
+        ESP_LOGW(kTag, "AirQuality server not ready on EP%u", getEndPointId());
+        return false;
+      }
+      const chip::BitMask<AirQuality::Feature> features(
+          AirQuality::Feature::kFair, AirQuality::Feature::kModerate,
+          AirQuality::Feature::kVeryPoor, AirQuality::Feature::kExtremelyPoor);
+      auto* inst = new (std::nothrow) AirQuality::Instance(getEndPointId(), features);
+      if (inst == nullptr || inst->Init() != CHIP_NO_ERROR) {
+        ESP_LOGE(kTag, "AirQuality instance init failed on EP%u", getEndPointId());
+        delete inst;
+        return false;
+      }
+      aq_inst_ = inst;
+    }
+    return aq_inst_->UpdateAirQuality(static_cast<AirQuality::AirQualityEnum>(v)) ==
+           chip::Protocols::InteractionModel::Status::Success;
+  }
   bool set_fault(bool fault) { return setBooleanStateValue(fault); }
+
+ private:
+  AirQuality::Instance* aq_inst_ = nullptr;
 };
 
 AirQualityEndpoint g_aq;
@@ -726,7 +756,40 @@ bool MatterHaBridge::begin(AppConfig* cfg, SemaphoreHandle_t cfg_mutex, QueueHan
   Matter.setVendorName("DIY");
   Matter.setProductName("AtomS3 IAQ Purifier Controller");
   Matter.setBLEMemoryReleaseEnabled(true);  // library releases BLE RAM safely after commissioning
-  Matter.onBLEMemoryReleased([]() { ESP_LOGI(kTag, "BLE memory released (commissioned)"); });
+  ble_released_.store(!Matter.isBLECommissioningEnabled());
+  Matter.onEvent([](matterEvent_t ev, const chip::DeviceLayer::ChipDeviceEvent*) {
+    if (g_self == nullptr) return;
+    switch (ev) {
+      case MATTER_COMMISSIONING_SESSION_STARTED:
+        g_self->commissioning_active_.store(true);
+        break;
+      case MATTER_COMMISSIONING_SESSION_STOPPED:
+        if (!chip::Server::GetInstance().GetFailSafeContext().IsFailSafeArmed()) {
+          g_self->commissioning_active_.store(false);
+        }
+        break;
+      case MATTER_COMMISSIONING_COMPLETE:
+        g_commissioned.store(true);
+        g_self->commissioning_active_.store(false);
+        break;
+      case MATTER_FAIL_SAFE_TIMER_EXPIRED:
+        g_self->commissioning_active_.store(false);
+        break;
+      case MATTER_BLE_DEINITIALIZED:
+        g_self->commissioning_active_.store(false);
+        g_self->ble_released_.store(true);
+        break;
+      default:
+        break;
+    }
+  });
+  Matter.onBLEMemoryReleased([]() {
+    if (g_self != nullptr) {
+      g_self->ble_released_.store(true);
+      g_self->commissioning_active_.store(false);
+    }
+    ESP_LOGI(kTag, "BLE memory released (free=%u)", static_cast<unsigned>(esp_get_free_heap_size()));
+  });
 
   // EP1: purifier fan (Off/Low/Med/High/Auto + percent slider)
   if (!g_fan.begin(0, MatterFan::FAN_MODE_AUTO, MatterFan::FAN_MODE_SEQ_OFF_LOW_MED_HIGH_AUTO)) return false;
@@ -933,8 +996,7 @@ void MatterHaBridge::publish_matter(const StatusSnapshot& s) {
   const float pm = avail ? s.pm25_sma5 : NAN;
   const int aq = matter_air_quality_from_pm25(pm);
   if (aq != pub_aq_) {
-    g_aq.set_enum8(AirQuality::Id, AirQuality::Attributes::AirQuality::Id, static_cast<uint8_t>(aq));
-    pub_aq_ = aq;
+    if (g_aq.set_air_quality(static_cast<uint8_t>(aq))) pub_aq_ = aq;
   }
   auto changed = [](float a, float b, float eps) { return (isnan(a) != isnan(b)) || (!isnan(a) && fabsf(a - b) >= eps); };
   if (changed(pm, pub_pm_, 0.1f)) {
@@ -999,10 +1061,17 @@ bool MatterHaBridge::matter_utc(time_t* utc) const {
     }
   }
   if (!ok && g_matter_utc_synced.load()) {
-    chip::System::Clock::Microseconds64 cur_us;
-    if (chip::System::SystemClock().GetClock_RealTime(cur_us) == CHIP_NO_ERROR) {
-      *utc = static_cast<time_t>(cur_us.count() / 1000000ULL);
+    const int64_t base = g_matter_utc_unix.load();
+    if (base >= clk::kValidEpoch) {
+      const uint32_t elapsed_s = (millis() - g_matter_utc_set_ms.load()) / 1000u;
+      *utc = static_cast<time_t>(base + static_cast<int64_t>(elapsed_s));
       ok = true;
+    } else {
+      chip::System::Clock::Microseconds64 cur_us;
+      if (chip::System::SystemClock().GetClock_RealTime(cur_us) == CHIP_NO_ERROR) {
+        *utc = static_cast<time_t>(cur_us.count() / 1000000ULL);
+        ok = true;
+      }
     }
   }
   chip::DeviceLayer::PlatformMgr().UnlockChipStack();

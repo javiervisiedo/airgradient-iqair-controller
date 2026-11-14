@@ -42,7 +42,11 @@ constexpr const char* kTag = "main";
 constexpr uint32_t kWdtTimeoutMs = 15000;
 constexpr uint32_t kStatusPublishMs = 5000;
 constexpr uint32_t kConfigSaveDebounceMs = 5000;
-constexpr uint32_t kHeapWarnBytes = 120 * 1024;   // SRS §6.2
+constexpr uint32_t kHeapWarnBleBytes = 8 * 1024;
+constexpr uint32_t kHeapWarnSteadyBytes = 24 * 1024;
+constexpr uint32_t kHeapWarnIntervalMs = 60000;
+constexpr uint32_t kCommissioningGraceMs = 45000;
+constexpr uint32_t kHttpRetryMs = 2000;
 constexpr uint32_t kDebounceMs = 50;
 constexpr uint32_t kShortMaxMs = 1000;      // < 1 s: mode cycle
 constexpr uint32_t kPairHoldMinMs = 3000;   // released after 3..10 s: REST API pairing mode
@@ -409,9 +413,17 @@ void publish_status(uint32_t now) {
   s.uptime_s = now / 1000;
   s.ir_frames_sent = g_ir.tx_frames();
   g_bridge.publish(s);
-  if (s.free_heap_bytes < kHeapWarnBytes) {
-    ESP_LOGW(kTag, "low heap: %u bytes (min %u)", static_cast<unsigned>(s.free_heap_bytes),
-             static_cast<unsigned>(s.min_free_heap_bytes));
+  const uint32_t warn_thresh = g_bridge.ble_released() ? kHeapWarnSteadyBytes : kHeapWarnBleBytes;
+  if (s.free_heap_bytes < warn_thresh) {
+    static uint32_t last_heap_warn_ms = 0;
+    static uint32_t last_heap_warn_val = UINT32_MAX;
+    if (last_heap_warn_ms == 0 || (now - last_heap_warn_ms >= kHeapWarnIntervalMs) ||
+        (s.free_heap_bytes + 2048u <= last_heap_warn_val)) {
+      last_heap_warn_ms = now;
+      last_heap_warn_val = s.free_heap_bytes;
+      ESP_LOGW(kTag, "low heap: %u bytes (min %u)", static_cast<unsigned>(s.free_heap_bytes),
+               static_cast<unsigned>(s.min_free_heap_bytes));
+    }
   }
 }
 
@@ -452,18 +464,51 @@ void net_task(void*) {
   const uint32_t boot_ms = millis();
   uint32_t last_poll = 0;
   bool first_poll = true;
+  bool got_ip = false;
+  uint32_t got_ip_ms = 0;
+  uint32_t last_http_try_ms = 0;
+  bool logged_comm_hold = false;
   ag::StaleDetector stale;
   for (;;) {
     const uint32_t now = millis();
     const auto ev = static_cast<WifiEvent>(g_wifi_ev.exchange(static_cast<uint8_t>(WifiEvent::NONE)));
     if (ev == WifiEvent::GOT_IP) {
+      got_ip = true;
+      got_ip_ms = now;
       g_clock.on_got_ip(g_gateway_ip.load(), now);
-      g_bridge.update_mdns(g_local_ip.load());  // set device_ip_ before httpd opens
-      g_bridge.start_http();
+      if (g_bridge.http_started()) g_bridge.update_mdns(g_local_ip.load());
     } else if (ev == WifiEvent::DISCONNECTED) {
+      got_ip = false;
       g_clock.on_disconnected();
+    } else if (!got_ip && g_wifi_connected.load()) {
+      got_ip = true;
+      got_ip_ms = now;
     }
-    g_clock.loop(now);
+
+    const bool ble_done = g_bridge.ble_released();
+    const bool commissioning_busy =
+        g_bridge.commissioning_active() ||
+        (!g_bridge.commissioned() && !ble_done && got_ip && (now - got_ip_ms < kCommissioningGraceMs));
+    if (commissioning_busy && !logged_comm_hold) {
+      logged_comm_hold = true;
+      ESP_LOGI(kTag, "deferring HTTP/AG poll during Matter commissioning (heap=%u)",
+               static_cast<unsigned>(esp_get_free_heap_size()));
+    } else if (!commissioning_busy && logged_comm_hold) {
+      logged_comm_hold = false;
+      ESP_LOGI(kTag, "commissioning settled, resuming network services (heap=%u)",
+               static_cast<unsigned>(esp_get_free_heap_size()));
+    }
+
+    if (g_wifi_connected.load() && !g_bridge.http_started() && !commissioning_busy &&
+        (ble_done || esp_get_free_heap_size() >= 28672u)) {
+      if (last_http_try_ms == 0 || (now - last_http_try_ms >= kHttpRetryMs)) {
+        last_http_try_ms = now;
+        g_bridge.update_mdns(g_local_ip.load());  // set device_ip_ before httpd opens
+        g_bridge.start_http();
+      }
+    }
+
+    if (!commissioning_busy) g_clock.loop(now);
     esp_task_wdt_reset();
 
     AppConfig cfg;
@@ -482,7 +527,7 @@ void net_task(void*) {
 #else
     const bool allow_http_poll = true;
 #endif
-    if (allow_http_poll && (first_poll ? g_wifi_connected.load() : (now - last_poll >= interval))) {
+    if (!commissioning_busy && allow_http_poll && (first_poll ? g_wifi_connected.load() : (now - last_poll >= interval))) {
       first_poll = false;
       last_poll = now;
       PollResult pr = {};
@@ -498,7 +543,7 @@ void net_task(void*) {
       }
       if (pr.stale) ESP_LOGW(kTag, "AirGradient data stale: boot counter unchanged for %d polls", stale.unchanged());
       if (xQueueSend(g_poll_q, &pr, pdMS_TO_TICKS(100)) != pdTRUE) ESP_LOGW(kTag, "poll queue full");
-    } else if (allow_http_poll && first_poll && (now - boot_ms >= kNoNetworkFailAfterMs)) {
+    } else if (!commissioning_busy && allow_http_poll && first_poll && (now - boot_ms >= kNoNetworkFailAfterMs)) {
       // No network for 2 min after boot: start counting failed polls anyway so the
       // watchdog caps and the unreachable alarm also cover "never connected".
       first_poll = false;

@@ -309,6 +309,7 @@ bool config_apply_json_patch(AppConfig* cfg, const char* json, size_t len, uint3
 #include <LittleFS.h>
 #include <Preferences.h>
 #include <esp_log.h>
+#include <nvs.h>
 
 namespace {
 constexpr const char* kTag = "cfg";
@@ -318,6 +319,13 @@ constexpr const char* kNvsKeyAgIp = "ag_ip";
 constexpr const char* kCfgPath = "/config.json";
 bool g_fs_ok = false;
 char g_io_buf[1024];
+
+bool nvs_namespace_exists(const char* ns) {
+  nvs_handle_t h = 0;
+  if (nvs_open(ns, NVS_READONLY, &h) != ESP_OK) return false;
+  nvs_close(h);
+  return true;
+}
 
 bool load_from_text(AppConfig* cfg, const char* text, size_t len, const char* src) {
   AppConfig tmp;
@@ -344,7 +352,7 @@ bool config_load(AppConfig* cfg) {
   std::lock_guard<std::recursive_mutex> guard(g_buf_mutex);
   config_set_defaults(cfg);
   Preferences p;
-  if (p.begin(kNvsNs, true)) {
+  if (nvs_namespace_exists(kNvsNs) && p.begin(kNvsNs, true)) {
     const size_t n = p.getString(kNvsKeyCfg, g_io_buf, sizeof(g_io_buf));
     p.end();
     if (n > 1 && load_from_text(cfg, g_io_buf, strlen(g_io_buf), "NVS")) return true;
@@ -405,7 +413,7 @@ bool config_save(const AppConfig& cfg) {
 
 bool state_load_ag_cached_ip(uint32_t* ipv4) {
   Preferences p;
-  if (!p.begin(kNvsNs, true)) return false;
+  if (!nvs_namespace_exists(kNvsNs) || !p.begin(kNvsNs, true)) return false;
   const uint32_t v = p.getUInt(kNvsKeyAgIp, 0);
   p.end();
   if (v == 0) return false;
@@ -431,7 +439,7 @@ bool state_load_api_token(char* out, size_t out_len) {
   if (out == nullptr || out_len == 0) return false;
   out[0] = '\0';
   Preferences p;
-  if (!p.begin(kNvsAuthNs, true)) return false;  // namespace absent: never paired
+  if (!nvs_namespace_exists(kNvsAuthNs) || !p.begin(kNvsAuthNs, true)) return false;  // namespace absent: never paired
   const size_t n = p.getString(kNvsKeyToken, out, out_len);
   p.end();
   return n > 1;
