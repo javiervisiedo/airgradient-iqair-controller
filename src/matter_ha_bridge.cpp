@@ -203,7 +203,12 @@ class AirPurifierEndpoint : public MatterEndPoint {
       return false;
     }
     setEndPointId(endpoint::get_id(ep));
-    ESP_LOGI(kTag, "EP%u air purifier ready", getEndPointId());
+    esp_matter_attr_val_t fmap = esp_matter_invalid(nullptr);
+    esp_matter_attr_val_t fseq = esp_matter_invalid(nullptr);
+    getAttributeVal(FanControl::Id, FanControl::Attributes::FeatureMap::Id, &fmap);
+    getAttributeVal(FanControl::Id, FanControl::Attributes::FanModeSequence::Id, &fseq);
+    ESP_LOGI(kTag, "EP%u air purifier ready (FeatureMap=0x%lx FanModeSeq=%u)", getEndPointId(),
+             static_cast<unsigned long>(fmap.val.u32), fseq.val.u8);
     return true;
   }
 
@@ -219,10 +224,11 @@ class AirPurifierEndpoint : public MatterEndPoint {
         if (fm == FanControl::FanModeEnum::kOff && ignore_next_fan_mode_off_) {
           ignore_next_fan_mode_off_ = false;
           needs_sync_.store(true);
-          ESP_LOGD(kTag, "ignoring SetFanModeToOff from Auto-burst PercentSetting=0");
+          ESP_LOGI(kTag, "FanControl rx FanMode=Off ignored (Auto-burst)");
           return true;
         }
         ignore_next_fan_mode_off_ = false;
+        ESP_LOGI(kTag, "FanControl rx FanMode=%u", val->val.u8);
         switch (fm) {
           case FanControl::FanModeEnum::kAuto:
           case FanControl::FanModeEnum::kSmart:
@@ -261,6 +267,7 @@ class AirPurifierEndpoint : public MatterEndPoint {
       case FanControl::Attributes::PercentSetting::Id: {
         if (val->type == ESP_MATTER_VAL_TYPE_NULLABLE_UINT8 &&
             chip::app::NumericAttributeTraits<uint8_t>::IsNullValue(val->val.u8)) {
+          ESP_LOGI(kTag, "FanControl rx PercentSetting=null");
           return true;  // Auto clears PercentSetting to null; never post SET_MANUAL
         }
         if (val->val.u8 > 100) {
@@ -273,12 +280,13 @@ class AirPurifierEndpoint : public MatterEndPoint {
             ignore_next_fan_mode_off_ = true;
           }
           needs_sync_.store(true);
-          ESP_LOGI(kTag, "ignoring burst PercentSetting=%u right after FanMode=Auto", val->val.u8);
+          ESP_LOGI(kTag, "FanControl rx burst PercentSetting=%u right after FanMode=Auto", val->val.u8);
           return true;
         }
         has_auto_write_ = false;
         ignore_next_fan_mode_off_ = false;
         const uint8_t speed = static_cast<uint8_t>(iaq::percent_to_speed(val->val.u8));
+        ESP_LOGI(kTag, "FanControl rx PercentSetting=%u -> speed=%u", val->val.u8, speed);
         post(BridgeCmd{BridgeCmdType::SET_MANUAL, speed, false, 0, 0});
         esp_matter_attr_val_t pc = esp_matter_uint8(iaq::speed_to_percent(speed));
         g_publishing = true;
@@ -293,6 +301,7 @@ class AirPurifierEndpoint : public MatterEndPoint {
   }
 
   void set_auto(uint8_t pct) {
+    ESP_LOGI(kTag, "FanControl tx Auto (pct=%u)", pct);
     esp_matter_attr_val_t fm = esp_matter_enum8(chip::to_underlying(FanControl::FanModeEnum::kAuto));
     updateAttributeVal(FanControl::Id, FanControl::Attributes::FanMode::Id, &fm);
     // Ensure PercentSetting is null even if FanMode was already kAuto (e.g., burst write).
@@ -303,6 +312,7 @@ class AirPurifierEndpoint : public MatterEndPoint {
   }
 
   void set_manual(FanControl::FanModeEnum mode, uint8_t pct) {
+    ESP_LOGI(kTag, "FanControl tx Manual (mode=%u pct=%u)", chip::to_underlying(mode), pct);
     // Update FanMode before PercentSetting so PercentSetting != 0 isn't overwritten
     // and PercentSetting = 0 matches Off cleanly.
     esp_matter_attr_val_t fm = esp_matter_enum8(chip::to_underlying(mode));
