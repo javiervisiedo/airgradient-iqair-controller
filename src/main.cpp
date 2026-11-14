@@ -44,6 +44,7 @@ constexpr uint32_t kStatusPublishMs = 5000;
 constexpr uint32_t kConfigSaveDebounceMs = 5000;
 constexpr uint32_t kHeapWarnBleBytes = 8 * 1024;
 constexpr uint32_t kHeapWarnSteadyBytes = 24 * 1024;
+constexpr uint32_t kNetReadyHeapBytes = 28 * 1024;  // 28672 B: wait for NimBLE teardown before HTTP/AG allocs
 constexpr uint32_t kHeapWarnIntervalMs = 60000;
 constexpr uint32_t kCommissioningGraceMs = 45000;
 constexpr uint32_t kHttpRetryMs = 2000;
@@ -485,22 +486,28 @@ void net_task(void*) {
       got_ip_ms = now;
     }
 
+    const bool wifi_up = g_wifi_connected.load();
     const bool ble_done = g_bridge.ble_released();
+    const uint32_t free_heap = esp_get_free_heap_size();
     const bool commissioning_busy =
         g_bridge.commissioning_active() ||
         (!g_bridge.commissioned() && !ble_done && got_ip && (now - got_ip_ms < kCommissioningGraceMs));
-    if (commissioning_busy && !logged_comm_hold) {
+    const bool net_services_ready =
+        !commissioning_busy &&
+        (ble_done || free_heap >= kNetReadyHeapBytes || (got_ip && (now - got_ip_ms >= kCommissioningGraceMs)));
+    const bool deferring_net = commissioning_busy || (got_ip && !net_services_ready);
+    if (deferring_net && !logged_comm_hold) {
       logged_comm_hold = true;
       ESP_LOGI(kTag, "deferring HTTP/AG poll during Matter commissioning (heap=%u)",
-               static_cast<unsigned>(esp_get_free_heap_size()));
-    } else if (!commissioning_busy && logged_comm_hold) {
+               static_cast<unsigned>(free_heap));
+    } else if (!deferring_net && logged_comm_hold) {
       logged_comm_hold = false;
       ESP_LOGI(kTag, "commissioning settled, resuming network services (heap=%u)",
-               static_cast<unsigned>(esp_get_free_heap_size()));
+               static_cast<unsigned>(free_heap));
     }
 
-    if (g_wifi_connected.load() && !g_bridge.http_started() && !commissioning_busy &&
-        (ble_done || esp_get_free_heap_size() >= 28672u)) {
+    if (wifi_up && !g_bridge.http_started() && !commissioning_busy &&
+        (ble_done || free_heap >= kNetReadyHeapBytes)) {
       if (last_http_try_ms == 0 || (now - last_http_try_ms >= kHttpRetryMs)) {
         last_http_try_ms = now;
         g_bridge.update_mdns(g_local_ip.load());  // set device_ip_ before httpd opens
@@ -508,7 +515,7 @@ void net_task(void*) {
       }
     }
 
-    if (!commissioning_busy) g_clock.loop(now);
+    if (net_services_ready) g_clock.loop(now);
     esp_task_wdt_reset();
 
     AppConfig cfg;
@@ -527,30 +534,37 @@ void net_task(void*) {
 #else
     const bool allow_http_poll = true;
 #endif
-    if (!commissioning_busy && allow_http_poll && (first_poll ? g_wifi_connected.load() : (now - last_poll >= interval))) {
-      first_poll = false;
-      last_poll = now;
-      PollResult pr = {};
-      pr.ok = g_ag.poll(cfg, &pr.m);
-      pr.resolved_ip = g_ag.resolved_ip();
-      pr.source = g_ag.last_source();
-      pr.stale = pr.ok ? stale.update(pr.m) : stale.stale();
-      pr.frozen = pr.ok && stale.frozen();
-      static bool warned_no_boot = false;
-      if (pr.ok && !pr.m.boot_valid && !warned_no_boot) {
-        warned_no_boot = true;
-        ESP_LOGW(kTag, "AirGradient reply has no 'boot' counter: stale/frozen detection inactive");
+    if (allow_http_poll) {
+      if (wifi_up) {
+        if (net_services_ready && (first_poll || (now - last_poll >= interval))) {
+          first_poll = false;
+          last_poll = now;
+          PollResult pr = {};
+          pr.ok = g_ag.poll(cfg, &pr.m);
+          pr.resolved_ip = g_ag.resolved_ip();
+          pr.source = g_ag.last_source();
+          pr.stale = pr.ok ? stale.update(pr.m) : stale.stale();
+          pr.frozen = pr.ok && stale.frozen();
+          static bool warned_no_boot = false;
+          if (pr.ok && !pr.m.boot_valid && !warned_no_boot) {
+            warned_no_boot = true;
+            ESP_LOGW(kTag, "AirGradient reply has no 'boot' counter: stale/frozen detection inactive");
+          }
+          if (pr.stale) ESP_LOGW(kTag, "AirGradient data stale: boot counter unchanged for %d polls", stale.unchanged());
+          if (xQueueSend(g_poll_q, &pr, pdMS_TO_TICKS(100)) != pdTRUE) ESP_LOGW(kTag, "poll queue full");
+        }
+      } else if (!commissioning_busy &&
+                 ((first_poll && (now - boot_ms >= kNoNetworkFailAfterMs)) ||
+                  (!first_poll && (now - last_poll >= interval)))) {
+        // No network for 2 min after boot (or offline between polls): count failed polls
+        // without allocating HTTP/mDNS buffers so watchdog caps and alarm still engage.
+        first_poll = false;
+        last_poll = now;
+        PollResult pr = {};
+        pr.ok = false;
+        pr.stale = stale.stale();
+        if (xQueueSend(g_poll_q, &pr, pdMS_TO_TICKS(100)) != pdTRUE) ESP_LOGW(kTag, "poll queue full");
       }
-      if (pr.stale) ESP_LOGW(kTag, "AirGradient data stale: boot counter unchanged for %d polls", stale.unchanged());
-      if (xQueueSend(g_poll_q, &pr, pdMS_TO_TICKS(100)) != pdTRUE) ESP_LOGW(kTag, "poll queue full");
-    } else if (!commissioning_busy && allow_http_poll && first_poll && (now - boot_ms >= kNoNetworkFailAfterMs)) {
-      // No network for 2 min after boot: start counting failed polls anyway so the
-      // watchdog caps and the unreachable alarm also cover "never connected".
-      first_poll = false;
-      last_poll = now;
-      PollResult pr = {};
-      pr.ok = false;
-      xQueueSend(g_poll_q, &pr, pdMS_TO_TICKS(100));
     }
     g_net_task_alive.store(true);
     esp_task_wdt_reset();
@@ -636,10 +650,12 @@ void setup() {
   delay(1500);  // let USB-CDC enumerate so boot logs are visible (setup only)
   ESP_LOGI(kTag, "atoms3-iaq-matter-controller boot, heap=%u", static_cast<unsigned>(esp_get_free_heap_size()));
 
-  // Task watchdog: 15 s, panic on trigger; loop task registered here.
+  // Task watchdog: 15 s, panic on trigger; keep Core 0 IDLE task watched (matching
+  // sdkconfig CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0=y so LittleFS::format()'s
+  // disableCore0WDT() succeeds cleanly; net_task sleeps 100 ms and uses bounded waits).
   esp_task_wdt_config_t wdt = {};
   wdt.timeout_ms = kWdtTimeoutMs;
-  wdt.idle_core_mask = 0;
+  wdt.idle_core_mask = (1u << 0);
   wdt.trigger_panic = true;
   if (esp_task_wdt_reconfigure(&wdt) != ESP_OK) esp_task_wdt_init(&wdt);
   esp_task_wdt_add(nullptr);

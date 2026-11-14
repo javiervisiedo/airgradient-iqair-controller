@@ -62,11 +62,17 @@ int next_sent_speed(int prev_sent_speed, uint8_t step_speed, int frame_idx, bool
 // Device executor: ESP32-S3 RMT TX, 1 MHz resolution, 38 kHz / 33 % carrier.
 // Fully non-blocking: call loop() from the main loop; it never waits.
 // ---------------------------------------------------------------------------
+#include <atomic>
 #include <functional>
 
 class IrNecPurifier {
  public:
   using TxCallback = std::function<void(uint8_t speed, uint16_t command_word)>;
+
+  IrNecPurifier() = default;
+  // Non-copyable/non-movable: begin() registers &tx_done_ with the RMT ISR.
+  IrNecPurifier(const IrNecPurifier&) = delete;
+  IrNecPurifier& operator=(const IrNecPurifier&) = delete;
 
   bool begin(int gpio, const AppConfig& cfg);
   void apply_config(const AppConfig& cfg);
@@ -102,6 +108,7 @@ class IrNecPurifier {
 
   void* chan_ = nullptr;     // rmt_channel_handle_t
   void* encoder_ = nullptr;  // rmt_encoder_handle_t
+  std::atomic<uint32_t> tx_done_{0};
   uint16_t address_ = kDefaultIrAddress;
   uint16_t codes_[kNumSpeeds] = {};
   bool wake_prefix_ = true;

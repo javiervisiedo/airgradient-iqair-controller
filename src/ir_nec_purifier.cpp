@@ -48,11 +48,20 @@ int next_sent_speed(int prev_sent_speed, uint8_t step_speed, int frame_idx, bool
 #ifndef UNIT_TEST
 #include <driver/rmt_encoder.h>
 #include <driver/rmt_tx.h>
+#include <esp_attr.h>
 #include <esp_log.h>
 
 namespace {
 constexpr const char* kTag = "ir";
 rmt_symbol_word_t g_symbols[ir::kNecSymbols];
+
+// std::atomic<uint32_t> compiles to inline memw/s32i/s32c1i on ESP32-S3 (no flash libatomic calls).
+IRAM_ATTR bool on_rmt_tx_done(rmt_channel_handle_t, const rmt_tx_done_event_data_t*,
+                              void* user_ctx) {
+  auto* done = static_cast<std::atomic<uint32_t>*>(user_ctx);
+  done->store(1u, std::memory_order_release);
+  return false;
+}
 }  // namespace
 
 bool IrNecPurifier::begin(int gpio, const AppConfig& cfg) {
@@ -85,6 +94,15 @@ bool IrNecPurifier::begin(int gpio, const AppConfig& cfg) {
   rmt_encoder_handle_t enc = nullptr;
   if (rmt_new_copy_encoder(&enc_cfg, &enc) != ESP_OK) {
     ESP_LOGE(kTag, "rmt_new_copy_encoder failed");
+    rmt_del_channel(chan);
+    return false;
+  }
+  tx_done_.store(0u, std::memory_order_relaxed);
+  rmt_tx_event_callbacks_t cbs = {};
+  cbs.on_trans_done = on_rmt_tx_done;
+  if (rmt_tx_register_event_callbacks(chan, &cbs, &tx_done_) != ESP_OK) {
+    ESP_LOGE(kTag, "rmt_tx_register_event_callbacks failed");
+    rmt_del_encoder(enc);
     rmt_del_channel(chan);
     return false;
   }
@@ -139,6 +157,8 @@ bool IrNecPurifier::start_frame(uint16_t cmd_word) {
     g_symbols[i].duration1 = sym[i].space_us == 0 ? 1 : sym[i].space_us;
     g_symbols[i].level1 = 0;
   }
+  // Clear completion flag before starting hardware TX so an immediate ISR cannot be lost.
+  tx_done_.store(0u, std::memory_order_release);
   rmt_transmit_config_t tc = {};
   tc.loop_count = 0;
   tc.flags.eot_level = 0;
@@ -153,7 +173,7 @@ bool IrNecPurifier::start_frame(uint16_t cmd_word) {
 }
 
 bool IrNecPurifier::frame_done() {
-  return rmt_tx_wait_all_done(static_cast<rmt_channel_handle_t>(chan_), 0) == ESP_OK;
+  return tx_done_.exchange(0u, std::memory_order_acq_rel) != 0u;
 }
 
 void IrNecPurifier::loop(uint32_t now_ms) {

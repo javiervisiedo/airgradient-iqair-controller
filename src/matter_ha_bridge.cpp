@@ -69,6 +69,7 @@ bool ota_header_is_valid(const uint8_t* data, size_t len) {
 #include <esp_app_format.h>
 #include <esp_http_server.h>
 #include <esp_log.h>
+#include <esp_mac.h>
 #include <esp_matter.h>
 #include <esp_ota_ops.h>
 #include <esp_random.h>
@@ -76,7 +77,6 @@ bool ota_header_is_valid(const uint8_t* data, size_t len) {
 #include <lwip/sockets.h>
 #include <mdns.h>
 #include <platform/PlatformManager.h>
-#include <system/SystemClock.h>
 
 #include <atomic>
 #include <errno.h>
@@ -755,6 +755,13 @@ bool MatterHaBridge::begin(AppConfig* cfg, SemaphoreHandle_t cfg_mutex, QueueHan
   Matter.selectNetwork(MATTER_NETWORK_WIFI);
   Matter.setVendorName("DIY");
   Matter.setProductName("AtomS3 IAQ Purifier Controller");
+  uint8_t mac[6] = {};
+  if (esp_efuse_mac_get_default(mac) == ESP_OK) {
+    char serial[24];
+    snprintf(serial, sizeof(serial), "ATOMS3-%02X%02X%02X%02X%02X%02X",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    Matter.setSerialNumber(serial);
+  }
   Matter.setBLEMemoryReleaseEnabled(true);  // library releases BLE RAM safely after commissioning
   ble_released_.store(!Matter.isBLECommissioningEnabled());
   Matter.onEvent([](matterEvent_t ev, const chip::DeviceLayer::ChipDeviceEvent*) {
@@ -1066,12 +1073,6 @@ bool MatterHaBridge::matter_utc(time_t* utc) const {
       const uint32_t elapsed_s = (millis() - g_matter_utc_set_ms.load()) / 1000u;
       *utc = static_cast<time_t>(base + static_cast<int64_t>(elapsed_s));
       ok = true;
-    } else {
-      chip::System::Clock::Microseconds64 cur_us;
-      if (chip::System::SystemClock().GetClock_RealTime(cur_us) == CHIP_NO_ERROR) {
-        *utc = static_cast<time_t>(cur_us.count() / 1000000ULL);
-        ok = true;
-      }
     }
   }
   chip::DeviceLayer::PlatformMgr().UnlockChipStack();
