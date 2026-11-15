@@ -201,8 +201,8 @@ Built on the official `Arduino-ESP32 Matter` / `ESP-Matter` SDK (`#include <Matt
 | **Endpoint 2** | **Air Quality Sensor** (`0x002C`) + **Temp/RH** (`0x0302`, `0x0307`) | `AirQuality (0x005B)`, `PM2.5Concentration (0x042A)`, `TVOCConcentration (0x042E)`, `NO2Concentration (0x0413)`, `CO2Concentration (0x040D)`, `Temperature (0x0402)`, `RelativeHumidity (0x0405)`, `BooleanState (0x0045)` (Sensor Fault) | Displays live **Air Quality Status**, **PM2.5 ($\mu\text{g/m}^3$)**, **CO₂ (ppm)**, **Temperature ($^\circ\text{C}$)**, and **Humidity (%)** directly inside the Apple Home Climate summary and Google Home Environment tab. Triggers a native fault alert if `alarm_sensor_unreachable == true` ($\ge 5\text{ mins}$ offline) [29]. |
 | **Endpoint 3** | **Night Quiet Lock Switch** (`0x010A` On/Off Plug-in Unit) | `OnOff (0x0006)` | Appears as **"Purifier Night Quiet Lock"**. Turning it **ON** activates `NIGHT_FORCE` mode; turning it **OFF** returns to the automatic `23:00–07:59` NTP schedule. |
 
-### 5.2 Local HTTP REST API (`/api/v1/*`) for Engineering Configuration & Diagnostics
-Alongside Matter, the firmware runs a lightweight HTTP server on port 80 (discoverable at `http://atoms3-iaq.local`) exposing all runtime configuration and telemetry in JSON format. Read-only endpoints (`GET`) are open on the LAN; endpoints that change the device (`PATCH /api/v1/config`, `POST /api/v1/command`) require the bearer token of §5.3:
+### 5.2 Local HTTP REST API & Built-in Web Dashboard (`/`, `/api/v1/*`)
+Alongside Matter, the firmware runs a lightweight HTTP server on port 80 (discoverable at `http://atoms3-iaq.local`). Opening `GET /` in a browser serves a self-contained read-only monitoring dashboard (live decision state, dominant trigger, contaminant gauges vs. thresholds, AirGradient/AtomS3 health, and recent activity timeline); sending `Accept: application/json` returns the JSON endpoint index. Read-only endpoints (`GET`) are open on the LAN; endpoints that change the device (`PATCH /api/v1/config`, `POST /api/v1/command`, `POST /api/v1/ota`) require the bearer token of §5.3:
 
 #### Read/Write Configuration Schema (`GET` / `PATCH http://atoms3-iaq.local/api/v1/config`)
 ```json
@@ -281,6 +281,9 @@ Alongside Matter, the firmware runs a lightweight HTTP server on port 80 (discov
 }
 ```
 
+#### Read-Only Activity Log (`GET http://atoms3-iaq.local/api/v1/events`)
+Returns up to the last **24** state transitions (`boot`, `speed_change`, `mode_change`, `ag_alarm`, `ag_recovered`, `watchdog_cap`) in newest-first order with timestamp (`uptime_s`), speed transition (`from` → `to`), `mode`, `trigger`, and SMA-5 readings at the transition (`pm25`, `tvoc`, `nox`, or `null`).
+
 ### 5.3 REST API Authentication & Button Pairing
 Modelled on local-API pairing used by smart-home vendors (e.g. Philips Hue, Nanoleaf): physical access to the device is the proof of ownership, and there is no shared default password (ETSI EN 303 645 provision 5.1; UK PSTI; EU RED cybersecurity requirements).
 
@@ -293,7 +296,7 @@ Modelled on local-API pairing used by smart-home vendors (e.g. Philips Hue, Nano
 4. **Authenticated endpoints:** `PATCH /api/v1/config` and `POST /api/v1/command` require the header `Authorization: Bearer <token>` (scheme case-insensitive). The token is compared in constant time.
    * Missing or wrong token: `401 Unauthorized` with `WWW-Authenticate: Bearer realm="atoms3-iaq"`.
    * **Lockout (per client address):** 5 wrong tokens from one client IP address within 60 s lock **that address** out for 60 s; other clients are unaffected (correct requests in between don't reset the count). During its lockout every authenticated request from that address (even with the right token) gets `429 Too Many Requests` with `Retry-After`. Up to 8 addresses are tracked; when the table is full the least recently active unlocked entry is replaced, so active lockouts are kept. A successful pairing clears all lockouts. Trailing whitespace after the token is ignored.
-5. **Open endpoints:** `GET /`, `GET /api/v1/status`, `GET /api/v1/config` (neither response contains secrets).
+5. **Open endpoints:** `GET /` (read-only Web Dashboard, or endpoint index when `Accept: application/json`), `GET /api/v1/status`, `GET /api/v1/events`, `GET /api/v1/config` (no response contains secrets).
 6. **Revocation:** pairing again revokes the old token; the ≥ 10 s factory reset erases it. The new token is persisted to NVS by the main loop, retried until the write succeeds, so a reboot can never bring back a revoked token.
 7. **Transport:** plain HTTP on the LAN (as with Hue's local API). The token protects against casual or accidental changes by other LAN devices, not against an attacker who can sniff LAN traffic.
 8. **Robustness:** request bodies are limited to 1.5 KB (`413 Payload Too Large` above that). Any request rejected before its body is read (401, 403, 413, 429) is answered with `Connection: close` and the connection is closed, so a slow or oversized upload can't hold up the server. Pairing windows and lockouts expire by elapsed time and are cleared when they expire, so they can never reappear (e.g. on the ~49.7-day `millis()` wrap).

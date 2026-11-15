@@ -2,6 +2,9 @@
 #include "matter_ha_bridge.h"
 
 #include <math.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <string.h>
 
 // ---------------------------------------------------------------------------
 // Pure helpers (compiled on both device and host UNIT_TEST builds)
@@ -60,6 +63,111 @@ bool ota_header_is_valid(const uint8_t* data, size_t len) {
   return chip_id == kOtaChipIdEsp32S3;
 }
 
+const char* activity_event_type_to_str(ActivityEventType t) {
+  switch (t) {
+    case ActivityEventType::BOOT: return "boot";
+    case ActivityEventType::SPEED_CHANGE: return "speed_change";
+    case ActivityEventType::MODE_CHANGE: return "mode_change";
+    case ActivityEventType::AG_ALARM: return "ag_alarm";
+    case ActivityEventType::AG_RECOVERED: return "ag_recovered";
+    case ActivityEventType::WATCHDOG_CAP: return "watchdog_cap";
+  }
+  return "boot";
+}
+
+const char* activity_trigger_to_str(ActivityTrigger t) {
+  switch (t) {
+    case ActivityTrigger::NONE: return "none";
+    case ActivityTrigger::PM25: return "pm25";
+    case ActivityTrigger::GAS: return "gas";
+    case ActivityTrigger::MANUAL: return "manual";
+    case ActivityTrigger::WATCHDOG: return "watchdog";
+  }
+  return "none";
+}
+
+void EventLog::clear() {
+  head_ = 0;
+  count_ = 0;
+  next_seq_ = 0;
+}
+
+uint32_t EventLog::push(const ActivityEvent& ev) {
+  ActivityEvent copy = ev;
+  copy.seq = ++next_seq_;
+  buf_[head_] = copy;
+  head_ = (head_ + 1) % kCapacity;
+  if (count_ < kCapacity) ++count_;
+  return copy.seq;
+}
+
+const ActivityEvent& EventLog::at_oldest(size_t i) const {
+  if (count_ == 0 || i >= count_) return buf_[0];
+  const size_t idx = (head_ + kCapacity - count_ + i) % kCapacity;
+  return buf_[idx];
+}
+
+namespace {
+bool append_fmt(char* out, size_t out_cap, size_t* pos, const char* fmt, ...)
+    __attribute__((format(printf, 4, 5)));
+
+bool append_fmt(char* out, size_t out_cap, size_t* pos, const char* fmt, ...) {
+  if (*pos >= out_cap) return false;
+  va_list ap;
+  va_start(ap, fmt);
+  const int n = vsnprintf(out + *pos, out_cap - *pos, fmt, ap);
+  va_end(ap);
+  if (n < 0 || static_cast<size_t>(n) >= (out_cap - *pos)) return false;
+  *pos += static_cast<size_t>(n);
+  return true;
+}
+
+bool append_x10_field(char* out, size_t out_cap, size_t* pos, const char* key, int16_t val_x10) {
+  if (val_x10 < 0) return append_fmt(out, out_cap, pos, "\"%s\":null", key);
+  return append_fmt(out, out_cap, pos, "\"%s\":%d.%d", key, val_x10 / 10, val_x10 % 10);
+}
+}  // namespace
+
+size_t events_to_json(const EventLog& log, uint32_t current_uptime_s, char* out, size_t out_cap) {
+  if (out == nullptr || out_cap == 0) return 0;
+  size_t pos = 0;
+  if (!append_fmt(out, out_cap, &pos, "{\"uptime_s\":%lu,\"total_events\":%lu,\"events\":[",
+                  static_cast<unsigned long>(current_uptime_s),
+                  static_cast<unsigned long>(log.total_pushed()))) {
+    return 0;
+  }
+  const size_t n = log.count();
+  for (size_t k = 0; k < n; ++k) {
+    const ActivityEvent& ev = log.at_oldest(n - 1 - k);  // newest first
+    const OperatingMode mode = ev.mode <= static_cast<uint8_t>(OperatingMode::NIGHT_FORCE)
+                                   ? static_cast<OperatingMode>(ev.mode)
+                                   : OperatingMode::AUTO;
+    if (!append_fmt(out, out_cap, &pos,
+                    "%s{\"seq\":%lu,\"uptime_s\":%lu,\"type\":\"%s\",\"from\":%d,\"to\":%u,"
+                    "\"mode\":\"%s\",\"trigger\":\"%s\",",
+                    k == 0 ? "" : ",",
+                    static_cast<unsigned long>(ev.seq),
+                    static_cast<unsigned long>(ev.uptime_s),
+                    activity_event_type_to_str(ev.type),
+                    static_cast<int>(ev.from_speed),
+                    static_cast<unsigned>(ev.to_speed),
+                    operating_mode_to_str(mode),
+                    activity_trigger_to_str(ev.trigger))) {
+      return 0;
+    }
+    if (!append_x10_field(out, out_cap, &pos, "pm25", ev.pm25_x10) ||
+        !append_fmt(out, out_cap, &pos, ",") ||
+        !append_x10_field(out, out_cap, &pos, "tvoc", ev.tvoc_x10) ||
+        !append_fmt(out, out_cap, &pos, ",") ||
+        !append_x10_field(out, out_cap, &pos, "nox", ev.nox_x10) ||
+        !append_fmt(out, out_cap, &pos, "}")) {
+      return 0;
+    }
+  }
+  if (!append_fmt(out, out_cap, &pos, "]}")) return 0;
+  return pos;
+}
+
 #ifndef UNIT_TEST
 #include <Matter.h>
 #include <app/clusters/air-quality-server/air-quality-server.h>
@@ -85,6 +193,7 @@ bool ota_header_is_valid(const uint8_t* data, size_t len) {
 
 #include "clock_sync.h"
 #include "iaq_algorithm.h"
+#include "web_dashboard.h"
 
 using namespace esp_matter;
 using namespace chip::app::Clusters;
@@ -100,7 +209,7 @@ constexpr uint16_t kHttpSendTimeoutS = 3;
 constexpr uint16_t kHttpCtrlPort = 32790;    // must not clash with Matter (5540) or other services
 constexpr size_t kHttpStackBytes = 6144;     // REST + OTA flash writes (large buffers are heap-allocated)
 constexpr uint16_t kHttpMaxSockets = 4;
-constexpr uint16_t kHttpMaxUriHandlers = 8;
+constexpr uint16_t kHttpMaxUriHandlers = 10;
 
 // Set while our own state is pushed into Matter. Publishing runs as scheduled
 // work in the CHIP task, so controller writes (also handled in the CHIP task)
@@ -780,12 +889,49 @@ esp_err_t h_pair(httpd_req_t* req) {
   return finish_unread(req);
 }
 
+bool ascii_contains_ci(const char* hay, const char* needle) {
+  if (hay == nullptr || needle == nullptr || *needle == '\0') return false;
+  for (const char* p = hay; *p != '\0'; ++p) {
+    const char* a = p;
+    const char* b = needle;
+    while (*a != '\0' && *b != '\0') {
+      const char ca = (*a >= 'A' && *a <= 'Z') ? (*a + 32) : *a;
+      const char cb = (*b >= 'A' && *b <= 'Z') ? (*b + 32) : *b;
+      if (ca != cb) break;
+      ++a;
+      ++b;
+    }
+    if (*b == '\0') return true;
+  }
+  return false;
+}
+
 esp_err_t h_root(httpd_req_t* req) {
-  static const char kIdx[] =
-      "{\"device\":\"atoms3-iaq-matter-controller\",\"endpoints\":[\"GET /api/v1/status\",\"GET /api/v1/config\","
-      "\"PATCH /api/v1/config (auth)\",\"POST /api/v1/command (auth)\",\"POST /api/v1/ota (auth)\","
-      "\"POST /api/v1/pair (pairing mode)\"],\"auth\":\"Authorization: Bearer <token>\"}";
-  return send_json(req, "200 OK", kIdx, sizeof(kIdx) - 1);
+  char accept[128] = {};
+  const char* a = header(req, "Accept", accept, sizeof(accept));
+  if (a != nullptr && ascii_contains_ci(a, "application/json") && !ascii_contains_ci(a, "text/html")) {
+    static const char kIdx[] =
+        "{\"device\":\"atoms3-iaq-matter-controller\",\"endpoints\":[\"GET /api/v1/status\","
+        "\"GET /api/v1/events\",\"GET /api/v1/config\",\"PATCH /api/v1/config (auth)\","
+        "\"POST /api/v1/command (auth)\",\"POST /api/v1/ota (auth)\","
+        "\"POST /api/v1/pair (pairing mode)\"],\"auth\":\"Authorization: Bearer <token>\"}";
+    return send_json(req, "200 OK", kIdx, sizeof(kIdx) - 1);
+  }
+  httpd_resp_set_status(req, "200 OK");
+  httpd_resp_set_type(req, "text/html; charset=utf-8");
+  httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+  return httpd_resp_send(req, kDashboardHtml, sizeof(kDashboardHtml) - 1);
+}
+
+esp_err_t h_events(httpd_req_t* req) {
+  EventLog log;
+  g_self->copy_events(&log);
+  char* buf = reinterpret_cast<char*>(g_http->arena);
+  const size_t n = events_to_json(log, millis() / 1000, buf, sizeof(g_http->arena));
+  if (n == 0 || n >= sizeof(g_http->arena)) {
+    return send_error(req, "500 Internal Server Error", "events overflow");
+  }
+  return send_json(req, "200 OK", buf, n);
 }
 
 constexpr size_t kOtaChunkBytes = 2048;
@@ -1063,6 +1209,7 @@ bool MatterHaBridge::start_http() {
   const httpd_uri_t uris[] = {
       {"/", HTTP_GET, h_root, nullptr},
       {"/api/v1/status", HTTP_GET, h_status, nullptr},
+      {"/api/v1/events", HTTP_GET, h_events, nullptr},
       {"/api/v1/config", HTTP_GET, h_config_get, nullptr},
       {"/api/v1/config", HTTP_PATCH, h_config_patch, nullptr},
       {"/api/v1/command", HTTP_POST, h_command, nullptr},
@@ -1101,6 +1248,24 @@ void MatterHaBridge::update_mdns(uint32_t ipv4) {
 void MatterHaBridge::copy_status(StatusSnapshot* out) const {
   xSemaphoreTake(status_mutex_, portMAX_DELAY);
   *out = status_;
+  xSemaphoreGive(status_mutex_);
+}
+
+void MatterHaBridge::log_event(const ActivityEvent& ev) {
+  if (status_mutex_ == nullptr) return;
+  xSemaphoreTake(status_mutex_, portMAX_DELAY);
+  events_.push(ev);
+  xSemaphoreGive(status_mutex_);
+}
+
+void MatterHaBridge::copy_events(EventLog* out) const {
+  if (out == nullptr) return;
+  if (status_mutex_ == nullptr) {
+    out->clear();
+    return;
+  }
+  xSemaphoreTake(status_mutex_, portMAX_DELAY);
+  *out = events_;
   xSemaphoreGive(status_mutex_);
 }
 

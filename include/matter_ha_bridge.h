@@ -15,6 +15,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "sys_config.h"
+
 // Pure helpers (compiled on both device and host UNIT_TEST builds).
 uint8_t matter_air_quality_from_pm25(float pm25);   // AirQualityEnum 1..6, 0 unknown
 uint8_t matter_level_from_tvoc_index(float idx);    // LevelValueEnum 1..4, 0 unknown
@@ -27,6 +29,63 @@ constexpr size_t kOtaMinImageBytes = 32;            // esp_image_header_t (24) +
 bool ota_size_is_valid(size_t content_len, size_t partition_size);
 bool ota_header_is_valid(const uint8_t* data, size_t len);
 
+// ---------------------------------------------------------------------------
+// On-device activity / decision event log (GET /api/v1/events)
+// ---------------------------------------------------------------------------
+enum class ActivityEventType : uint8_t {
+  BOOT = 0,
+  SPEED_CHANGE = 1,
+  MODE_CHANGE = 2,
+  AG_ALARM = 3,
+  AG_RECOVERED = 4,
+  WATCHDOG_CAP = 5,
+};
+
+enum class ActivityTrigger : uint8_t {
+  NONE = 0,
+  PM25 = 1,
+  GAS = 2,
+  MANUAL = 3,
+  WATCHDOG = 4,
+};
+
+const char* activity_event_type_to_str(ActivityEventType t);
+const char* activity_trigger_to_str(ActivityTrigger t);
+
+struct ActivityEvent {
+  uint32_t seq = 0;         // assigned by EventLog::push (1, 2, ...)
+  uint32_t uptime_s = 0;    // seconds since boot
+  ActivityEventType type = ActivityEventType::BOOT;
+  int8_t from_speed = -1;   // -1 if unknown / N/A
+  uint8_t to_speed = 0;     // 0..6
+  uint8_t mode = 0;         // OperatingMode (0=auto, 1=manual, 2=night_force)
+  ActivityTrigger trigger = ActivityTrigger::NONE;
+  int16_t pm25_x10 = -1;    // round(pm25_sma5 * 10), -1 if unavailable
+  int16_t tvoc_x10 = -1;    // round(tvoc_sma5 * 10), -1 if unavailable
+  int16_t nox_x10 = -1;     // round(nox_sma5 * 10), -1 if unavailable
+};
+
+class EventLog {
+ public:
+  static constexpr size_t kCapacity = 24;
+
+  void clear();
+  uint32_t push(const ActivityEvent& ev);
+  size_t count() const { return count_; }
+  uint32_t total_pushed() const { return next_seq_; }
+  // Index 0 = oldest retained event, count() - 1 = newest event.
+  const ActivityEvent& at_oldest(size_t i) const;
+
+ private:
+  ActivityEvent buf_[kCapacity] = {};
+  size_t head_ = 0;        // next write slot
+  size_t count_ = 0;       // valid items (0..kCapacity)
+  uint32_t next_seq_ = 0;  // total events pushed
+};
+
+// Serializes events in newest-first order into `out` (returns bytes written, or 0 on overflow).
+size_t events_to_json(const EventLog& log, uint32_t current_uptime_s, char* out, size_t out_cap);
+
 #ifndef UNIT_TEST
 #include <Arduino.h>
 #include <freertos/FreeRTOS.h>
@@ -36,7 +95,6 @@ bool ota_header_is_valid(const uint8_t* data, size_t len);
 #include <atomic>
 
 #include "api_auth.h"
-#include "sys_config.h"
 
 enum class BridgeCmdType : uint8_t {
   SET_AUTO,
@@ -143,6 +201,8 @@ class MatterHaBridge {
 
   // REST snapshot access (used by HTTP handlers).
   void copy_status(StatusSnapshot* out) const;
+  void log_event(const ActivityEvent& ev);
+  void copy_events(EventLog* out) const;
   AppConfig* config() { return cfg_; }
   SemaphoreHandle_t config_mutex() { return cfg_mutex_; }
   QueueHandle_t queue() { return cmd_q_; }
@@ -160,6 +220,7 @@ class MatterHaBridge {
   QueueHandle_t cmd_q_ = nullptr;
   StatusSnapshot status_;
   StatusSnapshot matter_pending_;
+  EventLog events_;  // guarded by status_mutex_
   bool started_ = false;
   std::atomic<bool> http_started_{false};
   std::atomic<bool> commissioning_active_{false};

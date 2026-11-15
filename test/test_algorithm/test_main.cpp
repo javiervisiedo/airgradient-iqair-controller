@@ -1232,6 +1232,67 @@ void test_ir_test_send_preserves_unknown_sent_speed() {
   TEST_ASSERT_EQUAL_HEX16(0xFA05, st[1].command_word);
 }
 
+void test_event_log_ring_buffer_and_json() {
+  EventLog log;
+  char buf[4096];
+
+  // Empty log
+  size_t n = events_to_json(log, 42, buf, sizeof(buf));
+  TEST_ASSERT_GREATER_THAN(0, n);
+  TEST_ASSERT_EQUAL_STRING("{\"uptime_s\":42,\"total_events\":0,\"events\":[]}", buf);
+
+  // Null telemetry entry
+  ActivityEvent boot_ev;
+  boot_ev.uptime_s = 1;
+  boot_ev.type = ActivityEventType::BOOT;
+  boot_ev.from_speed = -1;
+  boot_ev.to_speed = 0;
+  boot_ev.mode = static_cast<uint8_t>(OperatingMode::AUTO);
+  boot_ev.trigger = ActivityTrigger::NONE;
+  log.push(boot_ev);
+  n = events_to_json(log, 5, buf, sizeof(buf));
+  TEST_ASSERT_GREATER_THAN(0, n);
+  TEST_ASSERT_NOT_NULL(strstr(buf, "\"pm25\":null,\"tvoc\":null,\"nox\":null"));
+
+  // Fill beyond kCapacity (24) with worst-case field lengths; must still fit in 4096 bytes.
+  log.clear();
+  for (uint32_t i = 0; i < 30; ++i) {
+    ActivityEvent ev;
+    ev.uptime_s = 100000000u + i;
+    ev.type = ActivityEventType::WATCHDOG_CAP;
+    ev.from_speed = 6;
+    ev.to_speed = 3;
+    ev.mode = static_cast<uint8_t>(OperatingMode::NIGHT_FORCE);
+    ev.trigger = ActivityTrigger::WATCHDOG;
+    ev.pm25_x10 = 10000;  // 1000.0
+    ev.tvoc_x10 = 5000;   // 500.0
+    ev.nox_x10 = 5000;    // 500.0
+    TEST_ASSERT_EQUAL_UINT32(i + 1, log.push(ev));
+  }
+  TEST_ASSERT_EQUAL_UINT(EventLog::kCapacity, log.count());
+  TEST_ASSERT_EQUAL_UINT32(30, log.total_pushed());
+  TEST_ASSERT_EQUAL_UINT32(7, log.at_oldest(0).seq);
+  TEST_ASSERT_EQUAL_UINT32(30, log.at_oldest(EventLog::kCapacity - 1).seq);
+
+  n = events_to_json(log, 100000100u, buf, sizeof(buf));
+  TEST_ASSERT_GREATER_THAN(0, n);
+  TEST_ASSERT_LESS_THAN(sizeof(buf), n);
+  TEST_ASSERT_EQUAL(n, strlen(buf));
+
+  // Newest-first ordering: seq 30 appears before seq 29, and seq 6 was evicted
+  const char* p30 = strstr(buf, "\"seq\":30");
+  const char* p29 = strstr(buf, "\"seq\":29");
+  TEST_ASSERT_NOT_NULL(p30);
+  TEST_ASSERT_NOT_NULL(p29);
+  TEST_ASSERT_TRUE(p30 < p29);
+  TEST_ASSERT_NULL(strstr(buf, "\"seq\":6,"));
+  TEST_ASSERT_NOT_NULL(strstr(buf, "\"pm25\":1000.0,\"tvoc\":500.0,\"nox\":500.0"));
+
+  // Overflow returns 0 cleanly
+  char tiny[32];
+  TEST_ASSERT_EQUAL(0, events_to_json(log, 10, tiny, sizeof(tiny)));
+}
+
 int main(int, char**) {
   UNITY_BEGIN();
   RUN_TEST(test_TC01_matter_slider_sets_manual_and_auto_resumes);
@@ -1286,5 +1347,6 @@ int main(int, char**) {
   RUN_TEST(test_led_compose_and_double_flash_restart);
   RUN_TEST(test_config_edge_validation_and_mode_masks);
   RUN_TEST(test_ir_test_send_preserves_unknown_sent_speed);
+  RUN_TEST(test_event_log_ring_buffer_and_json);
   return UNITY_END();
 }

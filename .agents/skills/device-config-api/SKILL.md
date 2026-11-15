@@ -21,8 +21,9 @@ Implementation: `include/sys_config.h`, `src/sys_config.cpp`,
 
 | Method & Path | Auth | Behavior |
 | :--- | :--- | :--- |
-| `GET /` | Open | Lists endpoints |
+| `GET /` | Open | Read-only HTML monitoring dashboard (or JSON endpoint list when `Accept: application/json`) |
 | `GET /api/v1/status` | Open | Live `StatusSnapshot` + telemetry + `api_paired` / `api_pairing_active` (never returns secrets) |
+| `GET /api/v1/events` | Open | Last 24 state transitions (`boot`, `speed_change`, `mode_change`, `ag_alarm`, `ag_recovered`, `watchdog_cap`), newest-first |
 | `GET /api/v1/config` | Open | Current `AppConfig` JSON (contains no secrets) |
 | `PATCH /api/v1/config` | Bearer | Partial JSON patch (`config_apply_json_patch`), rejects unknown keys & invalid ranges (`422`), applies via `BridgeCmd::CONFIG_PATCHED`, debounced save |
 | `POST /api/v1/command` | Bearer | `{"action":"set_speed","mode":"auto"\|"manual","speed":0..6}`, `{"action":"test_ir","speed":0..6}`, `{"action":"reboot"}` (`202 Accepted`) |

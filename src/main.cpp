@@ -121,6 +121,7 @@ AgClient::Source g_ag_source = AgClient::Source::NONE;
 bool g_ag_stale = false;
 uint32_t g_last_status_ms = 0;
 bool g_status_dirty = true;
+OperatingMode g_last_logged_mode = OperatingMode::AUTO;
 
 // button
 bool g_btn_raw = false, g_btn_stable = false;
@@ -152,10 +153,44 @@ void mark_config_dirty(uint32_t now) {
   g_cfg_dirty_since_ms = now;
 }
 
+ActivityTrigger current_activity_trigger(bool is_watchdog = false) {
+  if (is_watchdog) return ActivityTrigger::WATCHDOG;
+  if (g_core.modes().mode() == OperatingMode::MANUAL) return ActivityTrigger::MANUAL;
+  const iaq::Trigger t = g_core.algo().dominant_trigger();
+  if (t == iaq::Trigger::GAS) return ActivityTrigger::GAS;
+  if (t == iaq::Trigger::PM25) return ActivityTrigger::PM25;
+  return ActivityTrigger::NONE;
+}
+
+int16_t to_x10(bool ok, float v) {
+  if (!ok || !isfinite(v) || v < 0.0f || v > 2000.0f) return -1;
+  return static_cast<int16_t>(lroundf(v * 10.0f));
+}
+
+void record_event(ActivityEventType type, int from_speed, int to_speed, bool is_watchdog = false) {
+  ActivityEvent ev;
+  ev.uptime_s = millis() / 1000;
+  ev.type = type;
+  ev.from_speed = static_cast<int8_t>(from_speed);
+  ev.to_speed = static_cast<uint8_t>(to_speed);
+  ev.mode = static_cast<uint8_t>(g_core.modes().mode());
+  ev.trigger = current_activity_trigger(is_watchdog);
+  const iaq::DualPathController& a = g_core.algo();
+  float pm = 0.0f, tvoc = 0.0f, nox = 0.0f;
+  ev.pm25_x10 = to_x10(g_have_meas && a.pm_avg(&pm), pm);
+  ev.tvoc_x10 = to_x10(g_have_meas && a.tvoc_avg(&tvoc), tvoc);
+  ev.nox_x10 = to_x10(g_have_meas && a.nox_avg(&nox), nox);
+  g_bridge.log_event(ev);
+}
+
 // Persist mode changes made via Matter / button (debounced against slider spam).
 void sync_mode_to_config(uint32_t now) {
-  xSemaphoreTake(g_cfg_mutex, portMAX_DELAY);
   const OperatingMode m = g_core.modes().mode();
+  if (m != g_last_logged_mode) {
+    g_last_logged_mode = m;
+    record_event(ActivityEventType::MODE_CHANGE, g_ir_speed_known ? g_ir_speed : -1, g_core.commanded_speed());
+  }
+  xSemaphoreTake(g_cfg_mutex, portMAX_DELAY);
   const uint8_t ms = g_core.modes().manual_speed();
   if (g_cfg.operating_mode != m || g_cfg.manual_speed != ms) {
     g_cfg.operating_mode = m;
@@ -165,7 +200,7 @@ void sync_mode_to_config(uint32_t now) {
   xSemaphoreGive(g_cfg_mutex);
 }
 
-void command_purifier(const iaq::TickResult& r) {
+void command_purifier(const iaq::TickResult& r, bool is_watchdog = false) {
   if (!r.speed_changed && !r.force_transmit) return;  // no decision (e.g. boot without data)
   const bool wake_after_test = g_test_reassert_pending;
   g_test_reassert_pending = false;
@@ -175,6 +210,10 @@ void command_purifier(const iaq::TickResult& r) {
   g_ir_speed_known = true;
   g_last_ir_refresh_ms = millis();
   g_status_dirty = true;
+  if (r.speed_changed) {
+    record_event(is_watchdog ? ActivityEventType::WATCHDOG_CAP : ActivityEventType::SPEED_CHANGE,
+                 from, r.commanded_speed, is_watchdog);
+  }
   ESP_LOGI(kTag, "purifier %d -> %d%s", from, r.commanded_speed, r.force_transmit ? " (forced)" : "");
 }
 
@@ -295,15 +334,18 @@ void drain_polls(uint32_t now) {
     const iaq::TickResult res = g_core.on_poll(usable, r, night, now);
     if (res.fault_event == iaq::SensorFaultMonitor::Event::ENTERED_ALARM) {
       ESP_LOGE(kTag, "AirGradient unreachable for %d polls: ALARM", g_core.fault().fail_count());
+      record_event(ActivityEventType::AG_ALARM, g_ir_speed_known ? g_ir_speed : -1, res.commanded_speed);
     } else if (res.fault_event == iaq::SensorFaultMonitor::Event::RECOVERED) {
       ESP_LOGW(kTag, "AirGradient recovered");
+      record_event(ActivityEventType::AG_RECOVERED, g_ir_speed_known ? g_ir_speed : -1, res.commanded_speed);
     }
-    if (!usable && res.speed_changed) {
+    const bool watchdog_cap = (!usable && res.speed_changed);
+    if (watchdog_cap) {
       ESP_LOGW(kTag, "watchdog cap (%s, %d failed polls): speed -> %d", night ? "night" : "day",
                g_core.fault().fail_count(), res.commanded_speed);
     }
     sync_mode_to_config(now);  // a manual timeout may have reverted to AUTO
-    command_purifier(res);
+    command_purifier(res, watchdog_cap);
     float pm_avg = NAN;
     g_core.algo().pm_avg(&pm_avg);
     ESP_LOGI(kTag, "[ctl] ok=%d frozen=%d pm=%.1f sma=%.1f tvoc=%.0f nox=%.1f night=%d pm_spd=%d gas_spd=%d algo=%d cmd=%d mode=%s ag=%s fails=%d heap=%u min_heap=%u",
@@ -690,6 +732,8 @@ void setup() {
     ++g_ir_flash_seq;
   });
 
+  // Runs before g_bridge.begin(), so any persisted-MANUAL command's SPEED_CHANGE
+  // event is ignored here; only the single BOOT event is recorded once bridge starts.
   command_purifier(g_core.begin(g_cfg, millis()));
   g_loop_cfg = g_cfg;
 
@@ -737,6 +781,8 @@ void setup() {
   ESP_LOGI(kTag, "before bridge init, heap=%u", static_cast<unsigned>(esp_get_free_heap_size()));
   const bool bridge_ok = g_bridge.begin(&g_cfg, g_cfg_mutex, g_cmd_q);
   if (!bridge_ok) ESP_LOGE(kTag, "Matter bridge init failed");
+  g_last_logged_mode = g_core.modes().mode();
+  if (bridge_ok) record_event(ActivityEventType::BOOT, -1, g_core.commanded_speed());
   ESP_LOGI(kTag, "after bridge init, heap=%u (min=%u)",
            static_cast<unsigned>(esp_get_free_heap_size()),
            static_cast<unsigned>(esp_get_minimum_free_heap_size()));
