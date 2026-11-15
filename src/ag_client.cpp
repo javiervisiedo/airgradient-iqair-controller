@@ -114,6 +114,8 @@ constexpr uint32_t kCachedTimeoutMs = 2500;   // SRS §2.2 step 2
 constexpr uint32_t kMdnsTimeoutMs = 2000;     // SRS §2.2 step 3
 constexpr int kMaxScanCandidates = 4;
 constexpr size_t kMaxAgBodyBytes = 2048;
+constexpr int kPollMaxAttempts = 3;
+constexpr uint32_t kRetryBackoffMs[] = {1000, 2000};
 
 struct ScopedBuf {
   char* ptr;
@@ -181,6 +183,7 @@ bool AgClient::fetch(const char* host, uint32_t timeout_ms, const char* serial, 
 
   bool ok = false;
   last_http_ = 0;
+  last_parse_ = ag::ParseResult::BAD_JSON;
   if (esp_http_client_open(c, 0) == ESP_OK) {
     esp_http_client_fetch_headers(c);
     last_http_ = esp_http_client_get_status_code(c);
@@ -213,6 +216,43 @@ bool AgClient::try_ip(uint32_t ip, uint32_t timeout_ms, const char* serial, ag::
   return fetch(host, timeout_ms, serial, out);
 }
 
+bool AgClient::fetch_with_retry(const char* host, uint32_t timeout_ms, const char* serial, ag::Measurement* out,
+                                const char* host_header, int max_attempts) {
+  if (max_attempts < 1) max_attempts = 1;
+  for (int attempt = 1; attempt <= max_attempts; ++attempt) {
+    esp_task_wdt_reset();
+    if (fetch(host, timeout_ms, serial, out, host_header)) {
+      if (attempt > 1) {
+        ESP_LOGI(kTag, "fetch %s: recovered on attempt %d/%d", host, attempt, max_attempts);
+      }
+      return true;
+    }
+    // If the device responded but serial didn't match, retrying will not help.
+    if (last_http_ == 200 && last_parse_ == ag::ParseResult::SERIAL_MISMATCH) {
+      return false;
+    }
+    if (attempt < max_attempts) {
+      const size_t num_backoffs = sizeof(kRetryBackoffMs) / sizeof(kRetryBackoffMs[0]);
+      const uint32_t backoff = (attempt - 1 < static_cast<int>(num_backoffs))
+                                   ? kRetryBackoffMs[attempt - 1]
+                                   : kRetryBackoffMs[num_backoffs - 1];
+      ESP_LOGW(kTag, "fetch %s failed (attempt %d/%d), retrying in %u ms...", host, attempt, max_attempts,
+               static_cast<unsigned>(backoff));
+      vTaskDelay(pdMS_TO_TICKS(backoff));
+      esp_task_wdt_reset();
+    }
+  }
+  return false;
+}
+
+bool AgClient::try_ip_with_retry(uint32_t ip, uint32_t timeout_ms, const char* serial, ag::Measurement* out,
+                                 int max_attempts) {
+  if (ip == 0) return false;
+  char host[16];
+  ip_to_str(ip, host, sizeof(host));
+  return fetch_with_retry(host, timeout_ms, serial, out, nullptr, max_attempts);
+}
+
 bool AgClient::poll(const AppConfig& cfg, ag::Measurement* out) {
   wifi_ap_record_t ap = {};
   if (esp_wifi_sta_get_ap_info(&ap) != ESP_OK) {
@@ -232,7 +272,7 @@ bool AgClient::poll(const AppConfig& cfg, ag::Measurement* out) {
       const char* port_part = colon ? colon : "";
       IPAddress ip;
       if (ip.fromString(host_only)) {
-        if (fetch(cfg.ag_target_host, kHostTimeoutMs, serial, out)) {
+        if (fetch_with_retry(cfg.ag_target_host, kHostTimeoutMs, serial, out, nullptr, kPollMaxAttempts)) {
           source_ = Source::TARGET_HOST;
           resolved_ip_ = static_cast<uint32_t>(ip);
           return true;
@@ -257,7 +297,7 @@ bool AgClient::poll(const AppConfig& cfg, ag::Measurement* out) {
           char target[32];
           snprintf(target, sizeof(target), "%u.%u.%u.%u%s", resolved & 0xFF, (resolved >> 8) & 0xFF,
                    (resolved >> 16) & 0xFF, (resolved >> 24) & 0xFF, port_part);
-          if (fetch(target, kHostTimeoutMs, serial, out, cfg.ag_target_host)) {
+          if (fetch_with_retry(target, kHostTimeoutMs, serial, out, cfg.ag_target_host, kPollMaxAttempts)) {
             source_ = Source::TARGET_HOST;
             resolved_ip_ = resolved;
             return true;
@@ -268,7 +308,7 @@ bool AgClient::poll(const AppConfig& cfg, ag::Measurement* out) {
     esp_task_wdt_reset();
   }
   // Step 2: cached IPv4 fast path
-  if (try_ip(cached_ip_, kCachedTimeoutMs, serial, out)) {
+  if (try_ip_with_retry(cached_ip_, kCachedTimeoutMs, serial, out, kPollMaxAttempts)) {
     source_ = Source::CACHED_IP;
     resolved_ip_ = cached_ip_;
     return true;
@@ -281,7 +321,7 @@ bool AgClient::poll(const AppConfig& cfg, ag::Measurement* out) {
   esp_ip4_addr_t a = {};
   if (mdns_query_a(host, kMdnsTimeoutMs, &a) == ESP_OK && a.addr != 0) {
     esp_task_wdt_reset();
-    if (try_ip(a.addr, kCachedTimeoutMs, serial, out)) {
+    if (try_ip_with_retry(a.addr, kCachedTimeoutMs, serial, out, 2)) {
       source_ = Source::MDNS_HOST;
       remember(a.addr);
       return true;

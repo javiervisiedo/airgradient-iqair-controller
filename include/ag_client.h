@@ -74,7 +74,11 @@ class AgClient {
  private:
   bool fetch(const char* host, uint32_t timeout_ms, const char* serial, ag::Measurement* out,
              const char* host_header = nullptr);
+  bool fetch_with_retry(const char* host, uint32_t timeout_ms, const char* serial, ag::Measurement* out,
+                        const char* host_header = nullptr, int max_attempts = 3);
   bool try_ip(uint32_t ip, uint32_t timeout_ms, const char* serial, ag::Measurement* out);
+  bool try_ip_with_retry(uint32_t ip, uint32_t timeout_ms, const char* serial, ag::Measurement* out,
+                         int max_attempts = 3);
   void remember(uint32_t ip);
 
   uint32_t resolved_ip_ = 0;
