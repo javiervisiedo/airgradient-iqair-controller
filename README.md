@@ -7,10 +7,11 @@ indoor air-quality monitor over the local network, runs the
 The device appears in **Apple Home and Google Home through Matter over Wi-Fi**
 (Multi-Admin), and has a **local REST API** for settings and diagnostics.
 
-> [!WARNING]
-> **Project status: pre-hardware.** The firmware compiles and its logic is covered by
-> host unit tests, but it has **not yet run on a physical AtomS3 Lite or purifier**.
-> Treat the first flash as a bring-up session (see [Known limitations](#known-limitations)).
+> [!NOTE]
+> **Project status: hardware verified.** The firmware is tested on physical hardware
+> (M5Stack AtomS3 Lite controlling an IQAir GC MultiGas purifier with local AirGradient ONE
+> polling). **Apple HomeKit integration is tested and verified** to work as expected.
+> **Google Home (Android)** has not yet been physically verified (see [Known limitations](#known-limitations)).
 
 ---
 
@@ -24,6 +25,7 @@ The device appears in **Apple Home and Google Home through Matter over Wi-Fi**
   - [Operating modes](#operating-modes)
   - [Button](#button)
   - [Status LED](#status-led)
+  - [Web dashboard](#web-dashboard)
   - [Apple Home and Google Home (Matter)](#apple-home-and-google-home-matter)
   - [REST API](#rest-api)
   - [Configuration reference](#configuration-reference)
@@ -287,21 +289,61 @@ is active) the normal states P5–P8 are **off**, unless `night_led_enabled` is 
 | P1 | AirGradient unreachable ≥ 5 min (speed per the watchdog caps) | Red, 3 Hz strobe | 80% / 40% |
 | P2 | Not paired with Matter | Magenta, 1 Hz pulse | 60% / 20% |
 | P2 | Wi-Fi disconnected | Blue, 2 Hz blink | 60% / 20% |
-| P3 | AirGradient poll failing for 1–4 min (speed held, or capped at night) | Amber, 1 Hz | 50% / 15% |
+| P3 | AirGradient poll failing for 1–4 min (speed held, or capped at night) | Amber / Yellow-Orange (`#FFAA00`), 1 Hz pulse (500 ms on / off) | 50% / 15% |
 | P4 | IR command sent | White, double flash | 70% / 10% |
 | P5 | Manual override active | Purple, slow breathing | 40% / off |
 | P6 | Auto, speeds 4–6 | Orange-red, solid | 40% / off |
 | P7 | Auto, speeds 2–3 | Cyan, solid | 30% / off |
 | P8 | Auto, speeds 0–1 | Emerald green, solid | 20% / off |
 
+> [!TIP]
+> **Intermittent Yellow/Orange (Amber) blinking:** If the LED alternates between solid
+> cyan (speeds 2–3) or green (speeds 0–1) and pulsing yellow/orange, the AtomS3 is experiencing
+> temporary HTTP/Wi-Fi timeouts communicating with the AirGradient monitor. The controller holds
+> its speed and retries up to 3 times per poll with exponential backoff; when a poll succeeds,
+> the LED returns to normal solid cyan/green.
+
+### Web dashboard
+
+A lightweight, zero-dependency HTML dashboard is built into the firmware and served directly
+at `http://atoms3-iaq.local/` (or the device IP) on port 80. You can bookmark and open it in any
+desktop or mobile browser without issuing CLI or `curl` commands:
+
+- **Live purifier status:** Commanded speed (0–6), operating mode (Auto, Manual, Night Force),
+  and dominant decision trigger (`pm25`, `gas`, `manual`, or `none`).
+- **AirGradient health:** Reachability (`online`, `degraded`, `unreachable_alarm`), failed poll counter,
+  and monitor freeze/stale detection.
+- **Environmental readings:** PM2.5 (instant & 5-min SMA), TVOC index, NOx index, CO₂ (ppm),
+  temperature (°C), and relative humidity (%).
+- **System diagnostics:** Free heap & minimum historical free heap (tracking SRAM margin),
+  uptime, Wi-Fi RSSI signal strength (dBm), and total IR command frames transmitted.
+- **Recent activity log:** Real-time log of the last 24 system events (speed transitions, mode
+  changes, sensor alarms, and watchdog caps) with auto-refresh every 5 seconds.
+
 ### Apple Home and Google Home (Matter)
+
+The AtomS3 acts as a native Matter over Wi-Fi bridge exposing a composite device:
 
 | Accessory | What you can do |
 | :--- | :--- |
-| **Air Purifier** (`0x002D`) | On/off, **Auto** vs manual, speed slider in 6 steps (≈ 17% per speed). Moving the slider switches to MANUAL. Selecting Auto immediately resumes the algorithm |
-| **Air quality sensor** | Air quality rating (from PM2.5), PM2.5 (µg/m³), CO₂ (ppm), TVOC and NO₂ levels (low to critical), temperature and humidity. A fault flag is set when the AirGradient has been unreachable for 5 min or more |
+| **Air Purifier** (`0x002D`) | On/Off toggle, **Auto** vs **Manual** mode, and discrete 6-step speed slider (≈ 17% per speed). |
+| **Air quality sensor** (`0x002C`) | Air quality rating (EPA PM2.5-aligned), PM2.5 (µg/m³), CO₂ (ppm), TVOC and NO₂ levels (low to critical), temperature, and humidity. Sets a Matter fault alarm if the monitor is unreachable for ≥ 5 min. |
 
-Speed mapping: off = 0%, speed 1 = 17%, 2 = 33%, 3 = 50%, 4 = 67%, 5 = 83%, 6 = 100%.
+Speed mapping: Off = 0%, Speed 1 = 17%, Speed 2 = 33%, Speed 3 = 50%, Speed 4 = 67%, Speed 5 = 83%, Speed 6 = 100%.
+
+**Hardware verification & controller support:**
+- **Apple Home (iOS / macOS / HomePod): Verified on hardware.**
+  - **Auto ↔ Manual mode toggling:** Switching between Auto and Manual modes updates smoothly.
+    A genuine tap from Auto to Manual automatically resumes the **current running speed** (if running)
+    or the **last non-zero speed** (rather than jumping to 100%).
+  - **Coalesced write handling:** Apple Home sends a rapid two-write sequence (`FanMode = High` followed
+    ~38 ms later by `FanMode = Auto`) when turning on into Auto. The firmware defers the High write by
+    120 ms, absorbing the burst cleanly without spurious fan revs or state snapbacks.
+  - **Smooth slider interaction:** Dragging the manual speed slider does not overwrite the user's
+    target percentage while dragging, updating `PercentCurrent` to quantized discrete steps.
+- **Google Home (Android): Remaining known testing item.**
+  - The firmware exposes standard Matter clusters compatible with Google Home via Matter Multi-Admin,
+    but physical verification with an active Google Nest / Home hub has not yet been performed.
 
 ### REST API
 
@@ -312,8 +354,9 @@ which you get by pairing with the button (the same idea as the Philips Hue bridg
 
 | Method and path | Auth | Purpose |
 | :--- | :--- | :--- |
-| `GET /` | – | Lists the endpoints |
+| `GET /` | – | Web dashboard for browsers; returns JSON endpoint directory if `Accept: application/json` |
 | `GET /api/v1/status` | – | Live state and telemetry |
+| `GET /api/v1/events` | – | Recent activity event log (ring buffer of the last 24 events) |
 | `GET /api/v1/config` | – | Current persistent configuration (contains no secrets) |
 | `PATCH /api/v1/config` | Token | Update one or more settings (validated, saved to NVS + `/config.json`, applied at once) |
 | `POST /api/v1/command` | Token | Actions: set speed/mode, test IR, reboot |
@@ -454,10 +497,13 @@ and the [SRS](docs/main_requirement_spec.md). In short:
 - **Arbitration:** target = max(PM path, gas path). Speed rises immediately; it drops by
   one speed after each hold period (4 min at 150 m³).
 - **AirGradient unreachable (network watchdog):**
+  - **Connection retry policy:** each 60 s poll tick attempts up to 3 immediate HTTP requests
+    (initial attempt, +2 s backoff, +4 s backoff) before registering a failed poll, mitigating
+    transient Wi-Fi packet drops.
 
   | Consecutive failed polls | Action |
   | :--- | :--- |
-  | 1–2 | Hold the current speed. Amber LED |
+  | 1–2 | Hold the current speed. Amber / Yellow-Orange LED (1 Hz pulse) |
   | ≥ 3 at night | Cap at speed 1 (lower only; Off stays Off) |
   | ≥ 5 | Raise the alarm: red LED, Matter fault flag. No IR command of its own |
   | ≥ 15 by day | Cap at speed 3 (so it can't stay on Turbo) |
@@ -514,7 +560,8 @@ pio device monitor -e atoms3
 | `IncompatiblePlatform ... v6.2.0-post.1` | Apply the pioarduino workaround in [Installation](#1-install-the-toolchain-once) |
 | No serial output | Use a USB **data** cable. Logs appear about 1.5 s after reset |
 | Pairing fails or hangs | Make sure the phone has Bluetooth on and is on the same 2.4 GHz network. Long-press 10 s to reset the pairings, then retry |
-| LED amber, then red | The AirGradient can't be reached. Check it's on the same network, or set `ag_target_host` to its IP |
+| LED blinking amber / yellow-orange (1 Hz) | The monitor poll timed out or failed (`ag_fail_count 1–4`). If it alternates with solid cyan/green, the connection is dropping intermittently. Check monitor Wi-Fi signal or set `ag_target_host` |
+| LED strobe red (3 Hz) | The AirGradient has been unreachable for ≥ 5 min (alarm). Check monitor power, LAN connectivity, or set `ag_target_host` to its IP |
 | `ag_data_stale: true` | The monitor's readings stopped updating. From the 4th unchanged reading the controller treats them as failed polls (amber LED, then the watchdog caps). Restart the AirGradient |
 | `401 Unauthorized` on PATCH/POST | Pair (hold the button 3–10 s, then `POST /api/v1/pair`) and send `Authorization: Bearer <token>`. After any re-pair or factory reset, old tokens stop working |
 | `403` from `/api/v1/pair` | Pairing mode isn't open, or it already gave out a token: hold the button again. If the message mentions the address, call `http://atoms3-iaq.local/api/v1/pair` or `http://<device-ip>/api/v1/pair` directly (not from a browser page or another hostname) |
@@ -526,13 +573,13 @@ pio device monitor -e atoms3
 
 ## Known limitations
 
-- **Not yet tested on hardware.** These still need real devices: Matter pairing with
-  Apple/Google, how controllers present the air quality endpoint, IR range, whether
-  the purifier wakes from standby on a speed code, HTTP OTA end-to-end flashing/rollback,
-  and Matter Time Synchronization (`0x0038`) with a live hub.
+- **Hardware verified on Apple HomeKit; Google Home (Android) pending test.** Physical hardware
+  (AtomS3 Lite, 38 kHz NEC IR transmitter, IQAir GC MultiGas purifier, and AirGradient ONE LAN polling)
+  and **Apple Home integration are tested and verified**. Google Home on Android uses standard
+  Matter Multi-Admin but has not yet been physically verified with an active Google Nest/Home hub.
 - **REST API over plain HTTP.** Changes need a paired token, but the token travels
   unencrypted on the LAN.
-- **Matter speed control is percent-based** (6 steps), not the MultiSpeed feature.
+- **Matter speed control is percent-based** (6 discrete steps), not the optional MultiSpeed feature.
 - **TVOC/NO₂ are reported as levels.** The AirGradient provides Sensirion indices, not concentrations.
 - **Clock tier 3:** the Time Synchronization cluster (`0x0038`) is instantiated on EP0,
   falling back to the HTTP `Date` header if no hub sets `UTCTime`.

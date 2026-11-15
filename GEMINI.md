@@ -24,12 +24,11 @@ flowchart LR
 
 ## Project phase
 
-**No physical AtomS3 Lite yet.** Until it arrives, verification happens in
-simulation (Wokwi) and in host unit tests. See the `wokwi-simulation` skill.
-
-**Phase 2 (current, since 2026-11-09): implementation.** The firmware lives at the
-repo root (`platformio.ini`, `src/`, `include/`, `test/`). Build with
-`~/.platformio/penv/bin/pio run -e atoms3`; host tests with `pio test -e native`.
+**Phase 3 (hardware bring-up & verification):** Physical AtomS3 Lite and IQAir GC MultiGas
+purifier are running the firmware with local AirGradient ONE HTTP API integration.
+**Apple HomeKit integration is tested and verified on physical hardware.** Google Home (Android)
+remains pending physical verification. Build with `~/.platformio/penv/bin/pio run -e atoms3`;
+host tests with `pio test -e native`.
 The pioarduino platform's install hook may replace PlatformIO with
 `pioarduino 6.2.0.post1`, which the platform then rejects. If that happens:
 `~/.platformio/penv/bin/python -m pip uninstall -y pioarduino && ~/.platformio/penv/bin/python -m pip install --force-reinstall platformio==6.2.0`.
