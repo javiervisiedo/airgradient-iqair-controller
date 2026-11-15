@@ -9,7 +9,7 @@ description: >-
 
 # Device Configuration & REST API
 
-**Finalized architecture (SRS v2.2 §5.2–5.3):** Local HTTP REST JSON server on
+**Finalized architecture (SRS v2.3 §5.2–5.3):** Local HTTP REST JSON server on
 port 80 (`esp_http_server.h`, mDNS `atoms3-iaq.local`), running alongside Matter.
 Wi-Fi provisioning uses Matter BLE commissioning (or `include/secrets.h` for
 dev/simulation).
@@ -26,7 +26,7 @@ Implementation: `include/sys_config.h`, `src/sys_config.cpp`,
 | `GET /api/v1/events` | Open | Last 24 state transitions (`boot`, `speed_change`, `mode_change`, `ag_alarm`, `ag_recovered`, `watchdog_cap`), newest-first |
 | `GET /api/v1/config` | Open | Current `AppConfig` JSON (contains no secrets) |
 | `PATCH /api/v1/config` | Bearer | Partial JSON patch (`config_apply_json_patch`), rejects unknown keys & invalid ranges (`422`), applies via `BridgeCmd::CONFIG_PATCHED`, debounced save |
-| `POST /api/v1/command` | Bearer | `{"action":"set_speed","mode":"auto"\|"manual","speed":0..6}`, `{"action":"test_ir","speed":0..6}`, `{"action":"reboot"}` (`202 Accepted`) |
+| `POST /api/v1/command` | Bearer | `{"action":"set_speed","mode":"auto"\|"night_force"}`, `{"action":"set_speed","mode":"manual","speed":0..6}`, `{"action":"test_ir","speed":0..6}`, `{"action":"reboot"}` (`202 Accepted`) |
 | `POST /api/v1/pair` | Pairing window + Host/Origin guard | Returns `{"token":"<32 hex>","token_type":"Bearer"}` once during the 60 s button window |
 
 ## Security & Robustness Invariants (`api_auth` + `matter_ha_bridge.cpp`)

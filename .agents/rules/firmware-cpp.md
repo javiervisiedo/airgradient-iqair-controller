@@ -25,24 +25,22 @@ globs: src/**/*.cpp,src/**/*.h,include/**/*.h,lib/**/*.cpp,lib/**/*.h,test/**/*.
   communicate only through FreeRTOS queues (`g_cmd_q`, `g_poll_q`), mutexes
   (`g_cfg_mutex`, `status_mutex_`, `auth_mutex_`), or `std::atomic` flags.
 - **Matter / CHIP task rules (`matter_ha_bridge.cpp`):**
-  - Expose the 3 composite endpoints in order: EP1 `MatterFan` (+ `air_purifier`
-    `0x002D`), EP2 `AirQualityEndpoint` (Air Quality + Temp/RH + `BooleanState`
-    fault, reporting `null`/`Unknown` when unreachable), and EP3
-    `MatterOnOffPlugin` (`"Purifier Night Quiet Lock"`).
-  - Matter attribute callbacks (`onChangeMode`, `onChangeSpeedPercent`,
-    `onChangeOnOff`) run in the CHIP task: check `if (g_publishing) return true;`
-    and only post a `BridgeCmd` to `g_cmd_q`. Never touch IR, LED, NVS, or
-    `ControlCore` directly from callbacks.
+  - Expose the 2 composite endpoints in order: EP1 `AirPurifierEndpoint`
+    (`0x002D` `air_purifier`) and EP2 `AirQualityEndpoint` (Air Quality + Temp/RH
+    + `BooleanState` fault, reporting `null`/`Unknown` when unreachable).
+  - Matter attribute callbacks (`AirPurifierEndpoint::attributeChangeCB`) run in
+    the CHIP task: check `if (g_publishing) return true;` and only post a
+    `BridgeCmd` to `g_cmd_q`. Never touch IR, LED, NVS, or `ControlCore`
+    directly from callbacks.
   - Publishing from `loop()` to Matter must use
     `chip::DeviceLayer::PlatformMgr().ScheduleWork(...)` (coalesced by
     `g_work_scheduled`) so `loop()` never blocks on the CHIP lock.
   - Reading Matter state from `net_task` (e.g., `matter_utc()`) must use
     `TryLockChipStack()`, never a blocking lock.
-  - `FanControl` invariant: in `FAN_MODE_AUTO`, never call
-    `g_fan.setSpeedPercent()` (writing `PercentSetting` flips `FanMode` out of
-    Auto); update `FanControl::Attributes::PercentCurrent::Id` via
-    `attribute::update(...)` instead. In `MANUAL`, call `setMode()` before
-    `setSpeedPercent()`.
+  - `FanControl` invariant: in Auto mode (`AirPurifierEndpoint::set_auto`), keep
+    `PercentSetting` null and update `PercentCurrent` via `updateAttributeVal`.
+    In `MANUAL` (`AirPurifierEndpoint::set_manual`), update `FanMode` before
+    `PercentSetting`.
 - **NVS / LittleFS writes:** `loop()` is the **only** writer of persistent config
   (`config_save`, debounced by `kConfigSaveDebounceMs`) and the REST API token
   (`state_save_api_token`, retried until NVS succeeds). Only write NVS/`/config.json`

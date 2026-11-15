@@ -6,6 +6,8 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "sys_config.h"
+
 // ---------------------------------------------------------------------------
 // Pure helpers (compiled on both device and host UNIT_TEST builds)
 // ---------------------------------------------------------------------------
@@ -168,6 +170,96 @@ size_t events_to_json(const EventLog& log, uint32_t current_uptime_s, char* out,
   return pos;
 }
 
+bool parse_command_json(const char* json, size_t len, uint8_t* arena_buf, size_t arena_size,
+                        BridgeCmd* out, const char** err) {
+  if (json == nullptr || arena_buf == nullptr || out == nullptr || err == nullptr) return false;
+  *err = nullptr;
+  *out = BridgeCmd{BridgeCmdType::SET_AUTO, 0, 0, 0};
+  JsonArena arena(arena_buf, arena_size);
+  {
+    JsonDocument doc(&arena);
+    const DeserializationError derr = deserializeJson(doc, json, len);
+    if (doc.overflowed()) {
+      *err = "JSON too complex";
+    } else if (derr || !doc.is<JsonObject>()) {
+      *err = "invalid JSON";
+    } else {
+      JsonObjectConst obj = doc.as<JsonObjectConst>();
+      bool saw_action = false, saw_mode = false, saw_speed = false;
+      for (JsonPairConst kv : obj) {
+        const char* k = kv.key().c_str();
+        if (strcmp(k, "action") == 0) {
+          saw_action = true;
+        } else if (strcmp(k, "mode") == 0) {
+          saw_mode = true;
+        } else if (strcmp(k, "speed") == 0) {
+          saw_speed = true;
+        } else {
+          *err = "unknown field in command";
+          break;
+        }
+      }
+      if (*err == nullptr) {
+        if (!saw_action || !obj["action"].is<const char*>()) {
+          *err = "unknown action (set_speed | test_ir | reboot)";
+        } else {
+          const char* action = obj["action"].as<const char*>();
+          JsonVariantConst sp = obj["speed"];
+          const bool valid_speed = saw_speed && sp.is<long>() && sp.as<long>() >= 0 && sp.as<long>() <= 6;
+          if (strcmp(action, "set_speed") == 0) {
+            if (saw_mode && !obj["mode"].is<const char*>()) {
+              *err = "set_speed mode must be 'auto', 'night_force', or 'manual'";
+            } else {
+              const char* mode = saw_mode ? obj["mode"].as<const char*>() : "manual";
+              if (strcmp(mode, "auto") == 0) {
+                if (saw_speed) {
+                  *err = "set_speed mode 'auto' does not take speed";
+                } else {
+                  out->type = BridgeCmdType::SET_AUTO;
+                }
+              } else if (strcmp(mode, "night_force") == 0) {
+                if (saw_speed) {
+                  *err = "set_speed mode 'night_force' does not take speed";
+                } else {
+                  out->type = BridgeCmdType::SET_NIGHT_FORCE;
+                }
+              } else if (strcmp(mode, "manual") == 0) {
+                if (!valid_speed) {
+                  *err = "set_speed mode 'manual' needs integer speed 0..6";
+                } else {
+                  out->type = BridgeCmdType::SET_MANUAL;
+                  out->speed = static_cast<uint8_t>(sp.as<long>());
+                }
+              } else {
+                *err = "set_speed mode must be 'auto', 'night_force', or 'manual'";
+              }
+            }
+          } else if (strcmp(action, "test_ir") == 0) {
+            if (saw_mode) {
+              *err = "test_ir does not take mode";
+            } else if (!valid_speed) {
+              *err = "test_ir needs integer speed 0..6";
+            } else {
+              out->type = BridgeCmdType::TEST_IR;
+              out->speed = static_cast<uint8_t>(sp.as<long>());
+            }
+          } else if (strcmp(action, "reboot") == 0) {
+            if (saw_mode || saw_speed) {
+              *err = "reboot does not take mode or speed";
+            } else {
+              out->type = BridgeCmdType::REBOOT;
+            }
+          } else {
+            *err = "unknown action (set_speed | test_ir | reboot)";
+          }
+        }
+      }
+    }
+  }
+  arena.reset();
+  return *err == nullptr;
+}
+
 #ifndef UNIT_TEST
 #include <Matter.h>
 #include <app/clusters/air-quality-server/air-quality-server.h>
@@ -264,7 +356,7 @@ TimeSyncDelegate g_time_sync_delegate;
 bool post(const BridgeCmd& c, TickType_t wait = 0);
 
 // Exposes protected ArduinoMatter::_init() so EP1 can initialize the Matter node
-// before AirQualityEndpoint (EP2) and MatterOnOffPlugin (EP3) are created.
+// before AirQualityEndpoint (EP2) is created.
 struct MatterNodeAccessor : public ArduinoMatter {
   static void ensure_init() { _init(); }
 };
@@ -335,7 +427,7 @@ class AirPurifierEndpoint : public MatterEndPoint {
           last_auto_write_ms_ = now;
           has_auto_write_ = true;
           ESP_LOGI(kTag, "FanControl rx FanMode=%u (Auto)", val->val.u8);
-          post(BridgeCmd{BridgeCmdType::SET_AUTO, 0, false, 0, 0});
+          post(BridgeCmd{BridgeCmdType::SET_AUTO, 0, 0, 0});
           needs_sync_.store(true);
           return true;
         }
@@ -357,23 +449,23 @@ class AirPurifierEndpoint : public MatterEndPoint {
         switch (fm) {
           case FanControl::FanModeEnum::kOff:
             has_auto_write_ = false;
-            post(BridgeCmd{BridgeCmdType::SET_MANUAL, 0, false, 0, 0});
+            post(BridgeCmd{BridgeCmdType::SET_MANUAL, 0, 0, 0});
             needs_sync_.store(true);
             break;
           case FanControl::FanModeEnum::kLow:
             has_auto_write_ = false;
-            post(BridgeCmd{BridgeCmdType::SET_MANUAL, 2, false, 0, 0});
+            post(BridgeCmd{BridgeCmdType::SET_MANUAL, 2, 0, 0});
             needs_sync_.store(true);
             break;
           case FanControl::FanModeEnum::kMedium:
             has_auto_write_ = false;
-            post(BridgeCmd{BridgeCmdType::SET_MANUAL, 4, false, 0, 0});
+            post(BridgeCmd{BridgeCmdType::SET_MANUAL, 4, 0, 0});
             needs_sync_.store(true);
             break;
           case FanControl::FanModeEnum::kHigh:
           case FanControl::FanModeEnum::kOn:
             has_auto_write_ = false;
-            post(BridgeCmd{BridgeCmdType::SET_MANUAL, 6, false, 0, 0});
+            post(BridgeCmd{BridgeCmdType::SET_MANUAL, 6, 0, 0});
             needs_sync_.store(true);
             break;
           default:
@@ -408,7 +500,7 @@ class AirPurifierEndpoint : public MatterEndPoint {
         ignore_next_fan_mode_off_ = false;
         const uint8_t speed = static_cast<uint8_t>(iaq::percent_to_speed(val->val.u8));
         ESP_LOGI(kTag, "FanControl rx PercentSetting=%u -> speed=%u", val->val.u8, speed);
-        post(BridgeCmd{BridgeCmdType::SET_MANUAL, speed, false, 0, 0});
+        post(BridgeCmd{BridgeCmdType::SET_MANUAL, speed, 0, 0});
         esp_matter_attr_val_t pc = esp_matter_uint8(iaq::speed_to_percent(speed));
         g_publishing = true;
         updateAttributeVal(FanControl::Id, FanControl::Attributes::PercentCurrent::Id, &pc);
@@ -461,7 +553,6 @@ class AirPurifierEndpoint : public MatterEndPoint {
 };
 
 AirPurifierEndpoint g_purifier;
-MatterOnOffPlugin g_night_lock;
 
 // ---------------------------------------------------------------------------
 // EP2: composite Air Quality + Temperature + Humidity sensor with a fault flag.
@@ -793,7 +884,7 @@ esp_err_t h_config_patch(httpd_req_t* req) {
   previous = *g_self->config();
   copy = previous;
   ok = config_apply_json_patch(&copy, g_http->body, len, &mask, err, sizeof(err));
-  BridgeCmd cmd{BridgeCmdType::CONFIG_PATCHED, copy.manual_speed, false, mask,
+  BridgeCmd cmd{BridgeCmdType::CONFIG_PATCHED, copy.manual_speed, mask,
                 static_cast<uint8_t>(copy.operating_mode)};
   if (ok) {
     // Mode fields are owned by the loop (it applies them to the mode controller and
@@ -823,40 +914,11 @@ esp_err_t h_command(httpd_req_t* req) {
   size_t len = 0;
   esp_err_t ret = ESP_OK;
   if (!read_body_or_reject(req, &len, &ret)) return ret;
-  BridgeCmd cmd{BridgeCmdType::SET_AUTO, 0, false, 0, 0};
+  BridgeCmd cmd{};
   const char* error = nullptr;
-  JsonArena arena(g_http->arena, sizeof(g_http->arena));
-  {
-    JsonDocument doc(&arena);
-    if (deserializeJson(doc, g_http->body, len) || !doc.is<JsonObject>()) {
-      error = "invalid JSON";
-    } else {
-      const char* action = doc["action"] | "";
-      JsonVariantConst sp = doc["speed"];
-      const bool has_speed = sp.is<int>() && sp.as<int>() >= 0 && sp.as<int>() <= 6;
-      if (strcmp(action, "set_speed") == 0) {
-        const char* mode = doc["mode"] | "manual";
-        if (strcmp(mode, "auto") == 0) {
-          cmd.type = BridgeCmdType::SET_AUTO;
-        } else if (strcmp(mode, "manual") == 0 && has_speed) {
-          cmd.type = BridgeCmdType::SET_MANUAL;
-          cmd.speed = static_cast<uint8_t>(sp.as<int>());
-        } else {
-          error = "set_speed needs mode 'auto', or mode 'manual' with speed 0..6";
-        }
-      } else if (strcmp(action, "test_ir") == 0) {
-        if (!has_speed) error = "test_ir needs speed 0..6";
-        cmd.type = BridgeCmdType::TEST_IR;
-        cmd.speed = has_speed ? static_cast<uint8_t>(sp.as<int>()) : 0;
-      } else if (strcmp(action, "reboot") == 0) {
-        cmd.type = BridgeCmdType::REBOOT;
-      } else {
-        error = "unknown action (set_speed | test_ir | reboot)";
-      }
-    }
+  if (!parse_command_json(g_http->body, len, g_http->arena, sizeof(g_http->arena), &cmd, &error)) {
+    return send_error(req, "400 Bad Request", error);
   }
-  arena.reset();
-  if (error != nullptr) return send_error(req, "400 Bad Request", error);
   if (!post(cmd, pdMS_TO_TICKS(100))) return send_error(req, "503 Service Unavailable", "busy, retry");
   static const char kOk[] = "{\"accepted\":true}";
   return send_json(req, "202 Accepted", kOk, sizeof(kOk) - 1);
@@ -1081,7 +1143,7 @@ esp_err_t h_ota(httpd_req_t* req) {
   httpd_resp_set_hdr(req, "Connection", kConnClose);
   static const char kOtaOk[] = "{\"status\":\"ok\",\"rebooting\":true}";
   send_json(req, "200 OK", kOtaOk, sizeof(kOtaOk) - 1);
-  if (!post(BridgeCmd{BridgeCmdType::REBOOT, 0, false, 0, 0}, pdMS_TO_TICKS(500))) {
+  if (!post(BridgeCmd{BridgeCmdType::REBOOT, 0, 0, 0}, pdMS_TO_TICKS(500))) {
     ESP_LOGW(kTag, "reboot command queue full; requesting reboot via loop flag");
     g_self->request_reboot();
   }
@@ -1149,14 +1211,6 @@ bool MatterHaBridge::begin(AppConfig* cfg, SemaphoreHandle_t cfg_mutex, QueueHan
 
   // EP2: composite air quality sensor
   if (!g_aq.begin()) return false;
-
-  // EP3: Night Quiet Lock
-  if (!g_night_lock.begin(false)) return false;
-  g_night_lock.onChangeOnOff([](bool on) -> bool {
-    if (g_publishing) return true;
-    post(BridgeCmd{BridgeCmdType::SET_NIGHT_FORCE, 0, on, 0, 0});
-    return true;
-  });
 
   // EP0: Time Synchronization cluster (0x0038) for Tier-3 clock sync.
   endpoint_t* root_ep = endpoint::get(node::get(), 0);
@@ -1332,14 +1386,6 @@ void MatterHaBridge::publish_matter(const StatusSnapshot& s) {
     }
     pub_speed_ = s.current_speed;
     pub_mode_ = mode;
-  }
-
-  // EP3 night lock mirrors NIGHT_FORCE
-  const bool night_lock = s.operating_mode == OperatingMode::NIGHT_FORCE;
-  if (!pub_night_valid_ || night_lock != pub_night_lock_) {
-    g_night_lock.setOnOff(night_lock);
-    pub_night_lock_ = night_lock;
-    pub_night_valid_ = true;
   }
 
   // EP2 sensors (unavailable while the AirGradient is unreachable)

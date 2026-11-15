@@ -59,8 +59,8 @@ via `AppConfig` (`include/sys_config.h`). Tests: `test/test_algorithm/test_main.
 ## Overrides and external commands
 
 `ModeController` enforces precedence between `AUTO`, `MANUAL` (Matter FanControl,
-REST `PATCH`/`POST`, button cycle), and `NIGHT_FORCE` (Matter Night Quiet Lock,
-REST). `MANUAL` is exempt from watchdog caps, and switching back to `AUTO`
+REST `PATCH`/`POST`, button cycle), and `NIGHT_FORCE` (REST `PATCH`/`POST`).
+`MANUAL` is exempt from watchdog caps, and switching back to `AUTO`
 immediately resumes `DualPathController::current_speed()` (kept warm in the
 background during `MANUAL` per SRS §3.3). All speed changes flow through
 `ControlCore` → `IrNecPurifier`.

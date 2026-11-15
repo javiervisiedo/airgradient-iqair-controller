@@ -53,8 +53,8 @@ flowchart LR
    and **TVOC/NOx** set a capped "gas floor". The higher target wins. Speed goes up
    immediately and comes down slowly. Day and night use different thresholds.
 3. When the target speed changes, the matching IQAir remote code is sent over IR.
-4. Apple Home and Google Home show a purifier tile (Auto/Manual, speed slider), an air
-   quality sensor, and a "Night Quiet Lock" switch.
+4. Apple Home and Google Home show an Air Purifier tile (Auto/Manual, speed slider) and
+   an air quality + temperature + humidity sensor.
 
 The full requirements are in [`docs/main_requirement_spec.md`](docs/main_requirement_spec.md)
 (firmware SRS) and [`docs/automated_iaq_multigas_fan_controller_spec_v3.md`](docs/automated_iaq_multigas_fan_controller_spec_v3.md)
@@ -257,7 +257,7 @@ If your network blocks mDNS, set `ag_target_host` to the monitor's IP address.
 | :--- | :--- |
 | **AUTO** (default) | The v3.0 algorithm sets the speed from the air readings and the day/night schedule |
 | **MANUAL** | Holds a fixed speed 0–6 until you switch back to Auto, or until `manual_timeout_mins` expires (0 = never). Polling continues so the averages stay current |
-| **NIGHT_FORCE** | Like AUTO, but always uses the quieter night thresholds. Turned on by the *Purifier Night Quiet Lock* switch |
+| **NIGHT_FORCE** | Like AUTO, but always uses the quieter night thresholds. Set via the REST API (`operating_mode: "night_force"` or `set_speed` with `mode: "night_force"`) |
 
 Manual overrides take precedence over automatic control. They come from the Apple/Google
 Home slider, the REST API, or the button.
@@ -275,8 +275,8 @@ code any more: the device re-sends it every 15 min, and `test_ir` does it on dem
 
 ### Status LED
 
-The highest-priority active state is shown. At night (23:00–07:59, or when the Night
-Quiet Lock is on) the normal states P5–P8 are **off**, unless `night_led_enabled` is set
+The highest-priority active state is shown. At night (23:00–07:59, or when `NIGHT_FORCE`
+is active) the normal states P5–P8 are **off**, unless `night_led_enabled` is set
 (then they show at a quarter of their day brightness). Faults and warnings always show.
 
 | Priority | State | Colour / pattern | Day / night brightness |
@@ -298,9 +298,8 @@ Quiet Lock is on) the normal states P5–P8 are **off**, unless `night_led_enabl
 
 | Accessory | What you can do |
 | :--- | :--- |
-| **Purifier** (Fan, plus the Air Purifier device type) | On/off, **Auto** vs manual, speed slider in 6 steps (≈ 17% per speed). Moving the slider switches to MANUAL. Selecting Auto resumes the algorithm |
+| **Air Purifier** (`0x002D`) | On/off, **Auto** vs manual, speed slider in 6 steps (≈ 17% per speed). Moving the slider switches to MANUAL. Selecting Auto immediately resumes the algorithm |
 | **Air quality sensor** | Air quality rating (from PM2.5), PM2.5 (µg/m³), CO₂ (ppm), TVOC and NO₂ levels (low to critical), temperature and humidity. A fault flag is set when the AirGradient has been unreachable for 5 min or more |
-| **Purifier Night Quiet Lock** (switch) | On = NIGHT_FORCE (night thresholds at any hour). Off = back to AUTO. Useful in "Goodnight" scenes |
 
 Speed mapping: off = 0%, speed 1 = 17%, 2 = 33%, 3 = 50%, 4 = 67%, 5 = 83%, 6 = 100%.
 
@@ -363,9 +362,11 @@ curl -s -X PATCH http://atoms3-iaq.local/api/v1/config -H "Authorization: Bearer
 curl -s -X PATCH http://atoms3-iaq.local/api/v1/config -H "Authorization: Bearer $IAQ_TOKEN" \
      -d '{"ag_target_host": "192.168.1.84"}'
 
-# Manual speed 4, then back to Auto
+# Manual speed 4, Night Force, then back to Auto
 curl -s -X POST http://atoms3-iaq.local/api/v1/command -H "Authorization: Bearer $IAQ_TOKEN" \
      -d '{"action":"set_speed","mode":"manual","speed":4}'
+curl -s -X POST http://atoms3-iaq.local/api/v1/command -H "Authorization: Bearer $IAQ_TOKEN" \
+     -d '{"action":"set_speed","mode":"night_force"}'
 curl -s -X POST http://atoms3-iaq.local/api/v1/command -H "Authorization: Bearer $IAQ_TOKEN" \
      -d '{"action":"set_speed","mode":"auto"}'
 
@@ -472,7 +473,7 @@ and the [SRS](docs/main_requirement_spec.md). In short:
     `pool.ntp.org` / `time.google.com`, then the HTTP `Date` header from the gateway or
     google.com if NTP fails for 30 s.
   - The time survives warm reboots.
-  - With no valid time, the controller uses **day mode**, unless the Night Quiet Lock is on.
+  - With no valid time, the controller uses **day mode**, unless `NIGHT_FORCE` is active.
 - **IR sending:**
   - Each command is sent as two frames 100 ms apart, with at least 100 ms between commands.
   - Going from Off to speed 2 or higher wakes the unit with Speed 1 first.

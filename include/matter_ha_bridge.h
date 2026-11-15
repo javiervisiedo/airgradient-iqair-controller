@@ -2,11 +2,10 @@
 // Home Assistant via Multi-Admin) + local HTTP REST API (SRS §2.1, §5).
 //
 // Endpoints (created in this order, IDs assigned by esp-matter):
-//   EP1 Fan 0x002B (+ Air Purifier 0x002D device type): OnOff/FanMode/Percent (6 steps)
+//   EP1 Air Purifier 0x002D: FanControl (Off/Low/Med/High/Auto + 6-step Percent)
 //   EP2 Air Quality Sensor 0x002C (+ Temperature 0x0302, Humidity 0x0307 device
 //       types): AirQuality, PM2.5 (numeric), CO2 (numeric), TVOC (level), NO2 (level),
 //       TemperatureMeasurement, RelativeHumidityMeasurement, BooleanState (fault)
-//   EP3 On/Off Plug-in Unit 0x010A "Purifier Night Quiet Lock"
 //
 // Threading: Matter callbacks (CHIP task) and HTTP handlers (httpd task) never
 // touch hardware; they post BridgeCmd messages to the main loop's queue.
@@ -86,20 +85,10 @@ class EventLog {
 // Serializes events in newest-first order into `out` (returns bytes written, or 0 on overflow).
 size_t events_to_json(const EventLog& log, uint32_t current_uptime_s, char* out, size_t out_cap);
 
-#ifndef UNIT_TEST
-#include <Arduino.h>
-#include <freertos/FreeRTOS.h>
-#include <freertos/queue.h>
-#include <freertos/semphr.h>
-
-#include <atomic>
-
-#include "api_auth.h"
-
 enum class BridgeCmdType : uint8_t {
   SET_AUTO,
   SET_MANUAL,       // speed
-  SET_NIGHT_FORCE,  // on
+  SET_NIGHT_FORCE,
   TEST_IR,          // speed
   REBOOT,
   CONFIG_PATCHED,   // non-mode fields already committed to the shared config; the loop
@@ -109,10 +98,23 @@ enum class BridgeCmdType : uint8_t {
 struct BridgeCmd {
   BridgeCmdType type;
   uint8_t speed;      // SET_MANUAL / TEST_IR; CONFIG_PATCHED: requested manual_speed
-  bool on;            // SET_NIGHT_FORCE
   uint32_t cfg_mask;  // CONFIG_PATCHED
   uint8_t mode;       // CONFIG_PATCHED with CFG_CHANGED_MODE: requested OperatingMode
 };
+
+// Parses and strictly validates POST /api/v1/command JSON using caller-supplied JsonArena buffer.
+bool parse_command_json(const char* json, size_t len, uint8_t* arena_buf, size_t arena_size,
+                        BridgeCmd* out, const char** err);
+
+#ifndef UNIT_TEST
+#include <Arduino.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
+#include <freertos/semphr.h>
+
+#include <atomic>
+
+#include "api_auth.h"
 
 // Live status published by the main loop (copied under a mutex for readers).
 struct StatusSnapshot {
@@ -237,8 +239,6 @@ class MatterHaBridge {
   int pub_mode_ = -1;
   bool pub_fault_ = false;
   bool pub_fault_valid_ = false;
-  bool pub_night_lock_ = false;
-  bool pub_night_valid_ = false;
   float pub_pm_ = -1, pub_co2_ = -1, pub_temp_ = -1000, pub_rh_ = -1;
   int pub_aq_ = -1, pub_tvoc_lvl_ = -1, pub_no2_lvl_ = -1;
 };

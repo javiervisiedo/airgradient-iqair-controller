@@ -96,7 +96,7 @@ answer goes into the spec.
 | Learning, importing, or verifying purifier IR codes | `ir-code-capture` |
 | Sending IR, purifier state model, pacing, resync | `purifier-ir-control` |
 | AQI math, thresholds, hysteresis, fail-safe | `air-quality-control-logic` |
-| Smart home (Matter Multi-Admin, EP1–EP3, Home Assistant inspection) | `matter-smart-home` |
+| Smart home (Matter Multi-Admin, EP1–EP2, Home Assistant inspection) | `matter-smart-home` |
 | Over-the-air firmware updates (dual-OTA layout, auth, rollback) | `esp32-ota-updates` |
 | Device settings API, validation, auth, NVS, provisioning | `device-config-api` |
 

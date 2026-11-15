@@ -283,7 +283,7 @@ void drain_commands(uint32_t now) {
         apply_mode_change(now);
         break;
       case BridgeCmdType::SET_NIGHT_FORCE:
-        g_core.modes().set_night_force(cmd.on, now);
+        g_core.modes().set_night_force(true, now);
         apply_mode_change(now);
         break;
       case BridgeCmdType::TEST_IR:

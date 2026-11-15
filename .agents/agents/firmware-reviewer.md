@@ -47,10 +47,10 @@ if `sim.sh check` passes (it uses the user's quota, so run at most once per revi
   - Blocking HTTP/mDNS/NVS/mutex wait, busy-wait on Wi-Fi, or `delay()` over 10 ms in `loop()`.
   - `esp_http_client` or `mdns_query_*` without bounded timeouts in `net_task`, or `net_task` missing `esp_task_wdt_reset()` between discovery/HTTP steps.
   - Calling `esp_task_wdt_reset()` from `httpd` handlers (`httpd` is not TWDT-registered).
-  - Matter attribute callbacks (`onChangeMode`, `onChangeSpeedPercent`, `onChangeOnOff`) touching IR, LED, NVS, or `ControlCore` directly instead of checking `g_publishing` and posting `BridgeCmd` to `g_cmd_q`.
+  - Matter attribute callbacks (`AirPurifierEndpoint::attributeChangeCB`) touching IR, LED, NVS, or `ControlCore` directly instead of checking `g_publishing` and posting `BridgeCmd` to `g_cmd_q`.
   - `loop()` blocking on the CHIP stack lock instead of `PlatformMgr().ScheduleWork(...)`, or `net_task` locking the CHIP stack without `TryLockChipStack()`.
-  - `FanControl` `FAN_MODE_AUTO` invariant violated: calling `g_fan.setSpeedPercent()` in Auto mode (must update `PercentCurrent` via `attribute::update(...)` only), or calling `setSpeedPercent()` before `setMode()` in `MANUAL`.
-  - Composite endpoint regressions across `MatterFan` (EP1), `AirQualityEndpoint` (EP2: must mark readings `null`/`Unknown` and set `BooleanState` fault when unreachable), and `MatterOnOffPlugin` (EP3 Night Quiet Lock).
+  - `FanControl` Auto invariant violated: writing a non-null `PercentSetting` in Auto mode (`set_auto()` must keep `PercentSetting` null and update `PercentCurrent`), or updating `PercentSetting` before `FanMode` in `MANUAL` (`set_manual()`).
+  - Composite endpoint regressions across `AirPurifierEndpoint` (EP1) and `AirQualityEndpoint` (EP2: must mark readings `null`/`Unknown` and set `BooleanState` fault when unreachable).
   - Overwriting the primary ESP-IDF mDNS hostname instead of registering a delegate (`mdns_delegate_hostname_add` / `mdns_service_add_for_host`).
 - **IR TX (`driver/rmt_tx.h`, `ir_nec_purifier`):**
   - RMT stop mark with `duration1 == 0` (must be `1` µs), sending IR from outside `loop()`, default address word not `0xFF00`, missing 2-frame repeat or inter-sequence gap, missing 600 ms Speed-1 wake prefix when waking from Off to speed >= 2 (when enabled), breaking open-loop periodic refresh (`ir_refresh_mins` / `resend()`), sending non-idempotent/timer codes, or using `IRremote.hpp`.

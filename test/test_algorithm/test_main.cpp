@@ -1293,6 +1293,49 @@ void test_event_log_ring_buffer_and_json() {
   TEST_ASSERT_EQUAL(0, events_to_json(log, 10, tiny, sizeof(tiny)));
 }
 
+void test_command_json_validation() {
+  alignas(8) uint8_t arena[4096];
+  auto check_ok = [&](const char* js, BridgeCmdType expected_type, uint8_t expected_speed = 0) {
+    BridgeCmd cmd{};
+    const char* err = nullptr;
+    TEST_ASSERT_TRUE_MESSAGE(parse_command_json(js, strlen(js), arena, sizeof(arena), &cmd, &err), js);
+    TEST_ASSERT_NULL(err);
+    TEST_ASSERT_EQUAL(static_cast<int>(expected_type), static_cast<int>(cmd.type));
+    TEST_ASSERT_EQUAL_UINT8(expected_speed, cmd.speed);
+  };
+  auto check_bad = [&](const char* js) {
+    BridgeCmd cmd{};
+    const char* err = nullptr;
+    TEST_ASSERT_FALSE_MESSAGE(parse_command_json(js, strlen(js), arena, sizeof(arena), &cmd, &err), js);
+    TEST_ASSERT_NOT_NULL(err);
+  };
+
+  check_ok("{\"action\":\"set_speed\",\"mode\":\"auto\"}", BridgeCmdType::SET_AUTO);
+  check_ok("{\"action\":\"set_speed\",\"mode\":\"night_force\"}", BridgeCmdType::SET_NIGHT_FORCE);
+  check_ok("{\"action\":\"set_speed\",\"mode\":\"manual\",\"speed\":4}", BridgeCmdType::SET_MANUAL, 4);
+  check_ok("{\"action\":\"set_speed\",\"speed\":0}", BridgeCmdType::SET_MANUAL, 0);  // omitted mode defaults to manual
+  check_ok("{\"action\":\"test_ir\",\"speed\":6}", BridgeCmdType::TEST_IR, 6);
+  check_ok("{\"action\":\"reboot\"}", BridgeCmdType::REBOOT);
+
+  // Reject malformed JSON, unknown fields, non-string mode, float/bool/out-of-range speed, and extraneous args
+  check_bad("not json");
+  check_bad("[]");
+  check_bad("{}");
+  check_bad("{\"action\":\"set_speed\",\"mod\":\"night_force\",\"speed\":4}");
+  check_bad("{\"action\":\"set_speed\",\"mode\":true,\"speed\":4}");
+  check_bad("{\"action\":\"set_speed\",\"mode\":null,\"speed\":4}");
+  check_bad("{\"action\":\"set_speed\",\"mode\":\"night_force\",\"speed\":99}");
+  check_bad("{\"action\":\"set_speed\",\"mode\":\"auto\",\"speed\":0}");
+  check_bad("{\"action\":\"set_speed\",\"mode\":\"manual\",\"speed\":3.5}");
+  check_bad("{\"action\":\"set_speed\",\"mode\":\"manual\",\"speed\":7}");
+  check_bad("{\"action\":\"set_speed\",\"mode\":\"manual\",\"speed\":-1}");
+  check_bad("{\"action\":\"set_speed\",\"mode\":\"manual\"}");
+  check_bad("{\"action\":\"test_ir\",\"mode\":\"auto\",\"speed\":3}");
+  check_bad("{\"action\":\"reboot\",\"speed\":0}");
+  check_bad("{\"action\":\"reboot\",\"mode\":\"auto\"}");
+  check_bad("{\"action\":\"unknown\"}");
+}
+
 int main(int, char**) {
   UNITY_BEGIN();
   RUN_TEST(test_TC01_matter_slider_sets_manual_and_auto_resumes);
@@ -1348,5 +1391,6 @@ int main(int, char**) {
   RUN_TEST(test_config_edge_validation_and_mode_masks);
   RUN_TEST(test_ir_test_send_preserves_unknown_sent_speed);
   RUN_TEST(test_event_log_ring_buffer_and_json);
+  RUN_TEST(test_command_json_validation);
   return UNITY_END();
 }
