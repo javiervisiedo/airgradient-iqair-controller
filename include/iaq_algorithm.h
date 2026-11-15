@@ -157,6 +157,10 @@ class ModeController {
   bool set_auto(uint32_t now_ms);
   bool set_manual(uint8_t speed, uint32_t now_ms);
   void set_manual_speed(uint8_t speed);  // updates stored preset without changing mode or timer
+  void record_nonzero_speed(int speed);
+  uint8_t last_nonzero_speed() const { return last_nonzero_speed_; }
+  uint8_t resume_manual_speed(int current_commanded_speed) const;
+  bool set_manual_resume(int current_commanded_speed, uint32_t now_ms);
   bool set_night_force(bool on, uint32_t now_ms);
   void set_manual_timeout(uint16_t mins) { manual_timeout_mins_ = mins; }
 
@@ -173,6 +177,7 @@ class ModeController {
  private:
   OperatingMode mode_ = OperatingMode::AUTO;
   uint8_t manual_speed_ = 0;
+  uint8_t last_nonzero_speed_ = 1;
   uint16_t manual_timeout_mins_ = 0;
   uint32_t manual_since_ms_ = 0;
 };

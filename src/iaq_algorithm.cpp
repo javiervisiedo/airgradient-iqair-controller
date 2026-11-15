@@ -213,6 +213,7 @@ void ModeController::begin(OperatingMode mode, uint8_t manual_speed, uint16_t ma
                            uint32_t now_ms) {
   mode_ = mode;
   manual_speed_ = manual_speed > kMaxSpeed ? kMaxSpeed : manual_speed;
+  last_nonzero_speed_ = (manual_speed_ >= 1) ? manual_speed_ : 1;
   manual_timeout_mins_ = manual_timeout_mins;
   manual_since_ms_ = now_ms;
 }
@@ -228,12 +229,31 @@ bool ModeController::set_manual(uint8_t speed, uint32_t now_ms) {
   const bool changed = (mode_ != OperatingMode::MANUAL) || (manual_speed_ != speed);
   mode_ = OperatingMode::MANUAL;
   manual_speed_ = speed;
+  record_nonzero_speed(manual_speed_);
   manual_since_ms_ = now_ms;  // every manual command restarts the timeout
   return changed;
 }
 
 void ModeController::set_manual_speed(uint8_t speed) {
   manual_speed_ = speed > kMaxSpeed ? kMaxSpeed : speed;
+  record_nonzero_speed(manual_speed_);
+}
+
+void ModeController::record_nonzero_speed(int speed) {
+  if (speed >= 1 && speed <= kMaxSpeed) {
+    last_nonzero_speed_ = static_cast<uint8_t>(speed);
+  }
+}
+
+uint8_t ModeController::resume_manual_speed(int current_commanded_speed) const {
+  if (current_commanded_speed >= 1 && current_commanded_speed <= kMaxSpeed) {
+    return static_cast<uint8_t>(current_commanded_speed);
+  }
+  return last_nonzero_speed_;
+}
+
+bool ModeController::set_manual_resume(int current_commanded_speed, uint32_t now_ms) {
+  return set_manual(resume_manual_speed(current_commanded_speed), now_ms);
 }
 
 bool ModeController::set_night_force(bool on, uint32_t) {
@@ -339,6 +359,7 @@ void ControlCore::set_commanded(int speed, TickResult* res) {
   if (res->speed_changed && have_commanded_) ++speed_changes_today_;
   commanded_speed_ = speed;
   have_commanded_ = true;
+  modes_.record_nonzero_speed(speed);
   res->commanded_speed = speed;
 }
 

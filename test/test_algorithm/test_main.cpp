@@ -108,6 +108,70 @@ void test_TC01_percent_speed_mapping_roundtrip() {
   TEST_ASSERT_EQUAL_UINT8(100, speed_to_percent(6));
 }
 
+void test_TC01_manual_resume_uses_current_or_last_nonzero_speed() {
+  // 1. Fresh boot in AUTO with manual_speed=0 and Auto idle at speed 0 -> falls back to speed 1.
+  {
+    Rig rig;
+    TEST_ASSERT_EQUAL(0, rig.core.commanded_speed());
+    TEST_ASSERT_EQUAL(1, rig.core.modes().resume_manual_speed(rig.core.commanded_speed()));
+    TEST_ASSERT_TRUE(rig.core.modes().set_manual_resume(rig.core.commanded_speed(), rig.now));
+    TickResult r = rig.core.on_mode_change(rig.now, false);
+    TEST_ASSERT_EQUAL(OperatingMode::MANUAL, rig.core.modes().mode());
+    TEST_ASSERT_EQUAL(1, r.commanded_speed);
+  }
+
+  // 2. Auto currently running at a non-zero speed (e.g., speed 3) -> Manual keeps speed 3.
+  {
+    Rig rig;
+    for (int i = 0; i < 3; ++i) rig.ok(22.0f);  // AUTO -> speed 3
+    TEST_ASSERT_EQUAL(3, rig.core.commanded_speed());
+    rig.core.modes().set_manual(5, rig.now);  // prior manual preset was 5
+    rig.core.modes().set_auto(rig.now);
+    TickResult r = rig.core.on_mode_change(rig.now, false);
+    TEST_ASSERT_EQUAL(3, r.commanded_speed);
+    TEST_ASSERT_TRUE(rig.core.modes().set_manual_resume(rig.core.commanded_speed(), rig.now));
+    r = rig.core.on_mode_change(rig.now, false);
+    TEST_ASSERT_EQUAL(OperatingMode::MANUAL, rig.core.modes().mode());
+    TEST_ASSERT_EQUAL(3, r.commanded_speed);
+  }
+
+  // 3. Auto drops back to speed 0 after previously running at speed 4 -> Manual resumes 4.
+  {
+    Rig rig;
+    rig.core.modes().set_manual(4, rig.now);
+    TickResult r = rig.core.on_mode_change(rig.now, false);
+    TEST_ASSERT_EQUAL(4, r.commanded_speed);
+    // Turning Manual to 0 (Off) must not overwrite last_nonzero_speed_.
+    rig.core.modes().set_manual(0, rig.now);
+    r = rig.core.on_mode_change(rig.now, false);
+    TEST_ASSERT_EQUAL(0, r.commanded_speed);
+    rig.core.modes().set_auto(rig.now);
+    for (int i = 0; i < 3; ++i) rig.ok(0.0f, 35.0f, 1.0f);  // AUTO idle at 0
+    TEST_ASSERT_EQUAL(0, rig.core.commanded_speed());
+    TEST_ASSERT_TRUE(rig.core.modes().set_manual_resume(rig.core.commanded_speed(), rig.now));
+    r = rig.core.on_mode_change(rig.now, false);
+    TEST_ASSERT_EQUAL(OperatingMode::MANUAL, rig.core.modes().mode());
+    TEST_ASSERT_EQUAL(4, r.commanded_speed);
+  }
+
+  // 4. Auto runs at speed 2 and steps down 2 -> 1 -> 0 -> last non-zero speed (1) is remembered.
+  {
+    Rig rig;
+    rig.core.modes().set_manual(5, rig.now);  // prior manual speed 5
+    rig.core.on_mode_change(rig.now, false);
+    rig.core.modes().set_auto(rig.now);
+    for (int i = 0; i < 3; ++i) rig.ok(14.0f);  // AUTO -> speed 2
+    TEST_ASSERT_EQUAL(2, rig.core.commanded_speed());
+    // AUTO steps down 2 -> 1 -> 0 over dwell windows, updating last_nonzero_speed_ to 1.
+    for (int i = 0; i < 12; ++i) rig.ok(0.0f, 35.0f, 1.0f);
+    TEST_ASSERT_EQUAL(0, rig.core.commanded_speed());
+    TEST_ASSERT_TRUE(rig.core.modes().set_manual_resume(rig.core.commanded_speed(), rig.now));
+    TickResult r = rig.core.on_mode_change(rig.now, false);
+    TEST_ASSERT_EQUAL(OperatingMode::MANUAL, rig.core.modes().mode());
+    TEST_ASSERT_EQUAL(1, r.commanded_speed);
+  }
+}
+
 // =================================================================== TC-02
 // Clock logic part: HTTP Date parsing and unsynced Day fallback.
 void test_TC02_http_date_parse() {
@@ -1340,6 +1404,7 @@ int main(int, char**) {
   UNITY_BEGIN();
   RUN_TEST(test_TC01_matter_slider_sets_manual_and_auto_resumes);
   RUN_TEST(test_TC01_percent_speed_mapping_roundtrip);
+  RUN_TEST(test_TC01_manual_resume_uses_current_or_last_nonzero_speed);
   RUN_TEST(test_TC02_http_date_parse);
   RUN_TEST(test_TC02_unsynced_clock_falls_back_to_day_unless_night_force);
   RUN_TEST(test_TC03_wake_from_off_to_speed4_sequence);

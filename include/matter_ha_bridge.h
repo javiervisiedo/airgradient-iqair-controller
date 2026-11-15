@@ -87,12 +87,13 @@ size_t events_to_json(const EventLog& log, uint32_t current_uptime_s, char* out,
 
 enum class BridgeCmdType : uint8_t {
   SET_AUTO,
-  SET_MANUAL,       // speed
+  SET_MANUAL,        // speed
+  SET_MANUAL_RESUME, // enter MANUAL using current/last non-zero speed
   SET_NIGHT_FORCE,
-  TEST_IR,          // speed
+  TEST_IR,           // speed
   REBOOT,
-  CONFIG_PATCHED,   // non-mode fields already committed to the shared config; the loop
-                    // applies effects, applies the requested mode, and persists
+  CONFIG_PATCHED,    // non-mode fields already committed to the shared config; the loop
+                     // applies effects, applies the requested mode, and persists
 };
 
 struct BridgeCmd {

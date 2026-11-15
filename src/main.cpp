@@ -282,6 +282,10 @@ void drain_commands(uint32_t now) {
         g_core.modes().set_manual(cmd.speed, now);
         apply_mode_change(now);
         break;
+      case BridgeCmdType::SET_MANUAL_RESUME:
+        g_core.modes().set_manual_resume(g_core.commanded_speed(), now);
+        apply_mode_change(now);
+        break;
       case BridgeCmdType::SET_NIGHT_FORCE:
         g_core.modes().set_night_force(true, now);
         apply_mode_change(now);
