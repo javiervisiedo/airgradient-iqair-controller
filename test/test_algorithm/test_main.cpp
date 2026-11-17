@@ -1400,6 +1400,46 @@ void test_command_json_validation() {
   check_bad("{\"action\":\"unknown\"}");
 }
 
+void test_matter_fan_control_auto_transition_helpers() {
+  // Burst window is wide enough for Wi-Fi / Home Hub MRP retries (400..500 ms).
+  TEST_ASSERT_GREATER_OR_EQUAL_UINT32(400, kMatterAutoBurstWindowMs);
+  TEST_ASSERT_LESS_OR_EQUAL_UINT32(500, kMatterAutoBurstWindowMs);
+
+  // PRE_UPDATE FanMode normalization prevents 0xF0 (WRITE_IGNORED) on kSmart / kOn.
+  TEST_ASSERT_EQUAL_UINT8(kMatterFanModeOff, matter_normalize_fan_mode_write(kMatterFanModeOff));
+  TEST_ASSERT_EQUAL_UINT8(kMatterFanModeLow, matter_normalize_fan_mode_write(kMatterFanModeLow));
+  TEST_ASSERT_EQUAL_UINT8(kMatterFanModeMedium, matter_normalize_fan_mode_write(kMatterFanModeMedium));
+  TEST_ASSERT_EQUAL_UINT8(kMatterFanModeHigh, matter_normalize_fan_mode_write(kMatterFanModeHigh));
+  TEST_ASSERT_EQUAL_UINT8(kMatterFanModeHigh, matter_normalize_fan_mode_write(kMatterFanModeOn));
+  TEST_ASSERT_EQUAL_UINT8(kMatterFanModeAuto, matter_normalize_fan_mode_write(kMatterFanModeAuto));
+  TEST_ASSERT_EQUAL_UINT8(kMatterFanModeAuto, matter_normalize_fan_mode_write(kMatterFanModeSmart));
+
+  // PRE_UPDATE PercentSetting sanitization during/in Auto avoids 0xCB (null=0xFF)
+  // and avoids SetFanModeToOff() (0 -> 1), while leaving 1..100 intact for WriteAttribute.
+  TEST_ASSERT_EQUAL_UINT8(1, matter_sanitize_auto_percent_setting_write(0));
+  TEST_ASSERT_EQUAL_UINT8(1, matter_sanitize_auto_percent_setting_write(kMatterNullableUint8Null));
+  TEST_ASSERT_EQUAL_UINT8(1, matter_sanitize_auto_percent_setting_write(1));
+  TEST_ASSERT_EQUAL_UINT8(31, matter_sanitize_auto_percent_setting_write(31));
+  TEST_ASSERT_EQUAL_UINT8(100, matter_sanitize_auto_percent_setting_write(100));
+
+  // Synchronous SetNull() re-enters attributeChangeCB iff FanMode changes to Auto
+  // AND stored PercentSetting was non-null.
+  TEST_ASSERT_TRUE(matter_expect_internal_set_null(kMatterFanModeLow, 31));
+  TEST_ASSERT_TRUE(matter_expect_internal_set_null(kMatterFanModeOff, 0));
+  TEST_ASSERT_FALSE(matter_expect_internal_set_null(kMatterFanModeAuto, 31));
+  TEST_ASSERT_FALSE(matter_expect_internal_set_null(kMatterFanModeLow, kMatterNullableUint8Null));
+  TEST_ASSERT_FALSE(matter_expect_internal_set_null(kMatterFanModeAuto, kMatterNullableUint8Null));
+
+  // Cross-task cmd_caught_up prevents stale MANUAL StatusSnapshot from overwriting EP1
+  // in the window after drain_commands() pops SET_AUTO but before publish_status() runs.
+  TEST_ASSERT_TRUE(matter_bridge_cmd_caught_up(0, 0, 0, false));
+  TEST_ASSERT_TRUE(matter_bridge_cmd_caught_up(0, 42, 42, false));
+  TEST_ASSERT_TRUE(matter_bridge_cmd_caught_up(0, 0xFFFFFFFFu, 0xFFFFFFFFu, false));
+  TEST_ASSERT_FALSE(matter_bridge_cmd_caught_up(1, 42, 42, false));   // still in queue
+  TEST_ASSERT_FALSE(matter_bridge_cmd_caught_up(0, 41, 42, false));   // popped by drain_commands, not yet published
+  TEST_ASSERT_FALSE(matter_bridge_cmd_caught_up(0, 42, 42, true));    // deferred FanMode=High timer active
+}
+
 int main(int, char**) {
   UNITY_BEGIN();
   RUN_TEST(test_TC01_matter_slider_sets_manual_and_auto_resumes);
@@ -1457,5 +1497,6 @@ int main(int, char**) {
   RUN_TEST(test_ir_test_send_preserves_unknown_sent_speed);
   RUN_TEST(test_event_log_ring_buffer_and_json);
   RUN_TEST(test_command_json_validation);
+  RUN_TEST(test_matter_fan_control_auto_transition_helpers);
   return UNITY_END();
 }

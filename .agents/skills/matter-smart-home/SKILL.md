@@ -33,7 +33,14 @@ Created in order in `MatterHaBridge::begin()`:
 When `operating_mode != MANUAL` (`kAuto`), the Matter `FanControl` server
 keeps `PercentSetting` null (`AirPurifierEndpoint::set_auto()` sets `FanMode = kAuto`,
 `PercentSetting = null`, and `PercentCurrent = pct` via `updateAttributeVal`).
-**Never write a non-null `PercentSetting` in Auto mode.**
+**Never write a non-null `PercentSetting` from `set_auto()`.** Conversely, in
+`AirPurifierEndpoint::attributeChangeCB` (`PRE_UPDATE`), **never rewrite a remote
+`PercentSetting` write to `null` (`0xFF`)**: `esp-matter`'s `WriteAttribute`
+rejects `0xFF` with `0xCB` (`INVALID_IN_STATE`) whenever `gWriteFromClusterLogic == 0`
+(only preserve `null` on the synchronous `PercentSetting::SetNull()` callback from
+`FanMode = kAuto`); let `1..100` (mapping `0` or remote `null` to `1`) pass
+`WriteAttribute` with `Status::Success` and let `publish_matter()` → `set_auto()`
+reset `PercentSetting` back to `null` via `updateAttributeVal`.
 
 In `MANUAL` mode, `AirPurifierEndpoint::set_manual()` updates `FanMode` *before*
 `PercentSetting` and `PercentCurrent` so the exact 6-step percent is preserved.

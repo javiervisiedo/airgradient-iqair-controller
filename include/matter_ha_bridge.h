@@ -107,6 +107,37 @@ struct BridgeCmd {
 bool parse_command_json(const char* json, size_t len, uint8_t* arena_buf, size_t arena_size,
                         BridgeCmd* out, const char** err);
 
+// Matter FanControl (0x0202) wire constants & pure PRE_UPDATE / sync helpers
+// (static_assert-checked against CHIP headers in device builds).
+constexpr uint8_t kMatterFanModeOff = 0;
+constexpr uint8_t kMatterFanModeLow = 1;
+constexpr uint8_t kMatterFanModeMedium = 2;
+constexpr uint8_t kMatterFanModeHigh = 3;
+constexpr uint8_t kMatterFanModeOn = 4;
+constexpr uint8_t kMatterFanModeAuto = 5;
+constexpr uint8_t kMatterFanModeSmart = 6;
+constexpr uint8_t kMatterNullableUint8Null = 0xFF;
+constexpr uint32_t kMatterAutoBurstWindowMs = 450;
+constexpr uint32_t kMatterHighCoalesceWindowMs = 120;
+
+// Normalizes kSmart (6) -> kAuto (5) and kOn (4) -> kHigh (3) in PRE_UPDATE so
+// fan-control-server's PreAttributeChanged does not return 0xF0 (WRITE_IGNORED).
+uint8_t matter_normalize_fan_mode_write(uint8_t raw_fm);
+
+// Maps burst/remote PercentSetting writes in Auto mode to 1..100 (0 or 0xFF -> 1)
+// so WriteAttribute passes PreAttributeChanged without 0xCB (INVALID_IN_STATE) and
+// without PostAttributeChanged calling SetFanModeToOff(); set_auto() then restores null.
+uint8_t matter_sanitize_auto_percent_setting_write(uint8_t raw_ps);
+
+// True iff accepting/rewriting FanMode=kAuto in PRE_UPDATE will cause esp-matter to
+// synchronously invoke PercentSetting::SetNull() and re-enter attributeChangeCB(null).
+bool matter_expect_internal_set_null(uint8_t cur_fan_mode, uint8_t cur_percent_setting_raw);
+
+// True iff all queued BridgeCmds have been drained AND published into StatusSnapshot,
+// and no deferred FanMode=High coalescing timer is active.
+bool matter_bridge_cmd_caught_up(uint32_t queue_waiting, uint32_t applied_seq,
+                                 uint32_t posted_seq, bool pending_high);
+
 #ifndef UNIT_TEST
 #include <Arduino.h>
 #include <freertos/FreeRTOS.h>
@@ -155,6 +186,7 @@ struct StatusSnapshot {
   uint32_t min_free_heap_bytes = 0;
   uint32_t uptime_s = 0;
   uint32_t ir_frames_sent = 0;
+  uint32_t applied_cmd_seq = 0;   // monotonic count of BridgeCmds drained by loop()
 };
 
 class MatterHaBridge {
@@ -209,6 +241,9 @@ class MatterHaBridge {
   AppConfig* config() { return cfg_; }
   SemaphoreHandle_t config_mutex() { return cfg_mutex_; }
   QueueHandle_t queue() { return cmd_q_; }
+  uint32_t inc_posted_cmd_seq() { return posted_cmd_seq_.fetch_add(1, std::memory_order_acq_rel) + 1; }
+  void dec_posted_cmd_seq() { posted_cmd_seq_.fetch_sub(1, std::memory_order_acq_rel); }
+  uint32_t posted_cmd_seq() const { return posted_cmd_seq_.load(std::memory_order_acquire); }
 
  private:
   void publish_matter(const StatusSnapshot& s);   // runs in the CHIP task only
@@ -221,6 +256,7 @@ class MatterHaBridge {
   auth::ApiAuth auth_;
   uint32_t auth_saved_gen_ = 0;   // guarded by auth_mutex_
   QueueHandle_t cmd_q_ = nullptr;
+  std::atomic<uint32_t> posted_cmd_seq_{0};
   StatusSnapshot status_;
   StatusSnapshot matter_pending_;
   EventLog events_;  // guarded by status_mutex_

@@ -121,6 +121,7 @@ AgClient::Source g_ag_source = AgClient::Source::NONE;
 bool g_ag_stale = false;
 uint32_t g_last_status_ms = 0;
 bool g_status_dirty = true;
+uint32_t g_applied_cmd_seq = 0;
 OperatingMode g_last_logged_mode = OperatingMode::AUTO;
 
 // button
@@ -273,6 +274,8 @@ void handle_config_patched(uint32_t mask, uint8_t mode, uint8_t manual_speed, ui
 void drain_commands(uint32_t now) {
   BridgeCmd cmd;
   while (xQueueReceive(g_cmd_q, &cmd, 0) == pdTRUE) {
+    ++g_applied_cmd_seq;
+    g_status_dirty = true;  // ensure matter_pending_.applied_cmd_seq catches up on this loop() turn
     switch (cmd.type) {
       case BridgeCmdType::SET_AUTO:
         g_core.modes().set_auto(now);
@@ -459,6 +462,7 @@ void publish_status(uint32_t now) {
   s.min_free_heap_bytes = esp_get_minimum_free_heap_size();
   s.uptime_s = now / 1000;
   s.ir_frames_sent = g_ir.tx_frames();
+  s.applied_cmd_seq = g_applied_cmd_seq;
   g_bridge.publish(s);
   const uint32_t warn_thresh = g_bridge.ble_released() ? kHeapWarnSteadyBytes : kHeapWarnBleBytes;
   if (s.free_heap_bytes < warn_thresh) {
