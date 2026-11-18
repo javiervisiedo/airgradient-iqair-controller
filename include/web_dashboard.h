@@ -2,6 +2,8 @@
 // Stored in Flash (.rodata); uses zero SRAM until served in chunks / single send.
 #pragma once
 
+#include "fw_version.h"
+
 constexpr const char kDashboardHtml[] = R"rawliteral(<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -53,6 +55,7 @@ button:hover{border-color:var(--acc)}
 .ev-r{color:var(--m);font-size:.77rem;font-variant-numeric:tabular-nums}
 .dot{width:8px;height:8px;border-radius:50%;display:inline-block;background:var(--ok)}
 .dot.err{background:var(--bad)}
+footer{margin-top:14px;padding:10px 4px 2px;border-top:1px solid var(--b);color:var(--m);font-size:.76rem;display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:8px}
 @media(max-width:520px){.spd{font-size:2rem}.card{padding:12px}}
 </style>
 </head>
@@ -123,6 +126,11 @@ button:hover{border-color:var(--acc)}
   <div class="hdr"><span>Recent Decision &amp; Health Log</span><span id="evCnt">0 events</span></div>
   <div class="ev-list" id="evList"><div class="ev">Loading activity log...</div></div>
 </section>
+
+<footer>
+  <span>AtomS3 IAQ Purifier Controller</span>
+  <span id="fwTxt">Firmware v)rawliteral" FW_VERSION_STR " (" FW_GIT_SHA ")" R"rawliteral(</span>
+</footer>
 
 <script>
 const $=id=>document.getElementById(id);
@@ -202,6 +210,7 @@ function renderStatus(s){
   $('heap').textContent=Math.round((s.free_heap_bytes||0)/1024)+' KB / '+Math.round((s.min_free_heap_bytes||0)/1024)+' KB min';
   $('uptime').textContent=fmtDur(s.uptime_s)+' / '+s.ir_frames_sent+' tx';
   $('matter').textContent=(s.matter_commissioned?s.matter_fabrics_count+' fabric(s)':'unpaired')+' / '+s.speed_changes_today+' today';
+  if(s.firmware_version)$('fwTxt').textContent='Firmware v'+s.firmware_version+(s.firmware_build?' ('+s.firmware_build+')':'');
 }
 
 function renderEvents(data){

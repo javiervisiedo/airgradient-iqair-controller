@@ -316,7 +316,8 @@ desktop or mobile browser without issuing CLI or `curl` commands:
 - **Environmental readings:** PM2.5 (instant & 5-min SMA), TVOC index, NOx index, CO₂ (ppm),
   temperature (°C), and relative humidity (%).
 - **System diagnostics:** Free heap & minimum historical free heap (tracking SRAM margin),
-  uptime, Wi-Fi RSSI signal strength (dBm), and total IR command frames transmitted.
+  uptime, Wi-Fi RSSI signal strength (dBm), total IR command frames transmitted, and running
+  **firmware version & build SHA** in the footer (auto-updated across OTA reboots).
 - **Recent activity log:** Real-time log of the last 24 system events (speed transitions, mode
   changes, sensor alarms, and watchdog caps) with auto-refresh every 5 seconds.
 
@@ -449,6 +450,7 @@ curl -s -X POST http://atoms3-iaq.local/api/v1/ota -H "Authorization: Bearer $IA
 | `api_paired`, `api_pairing_active` | Whether a REST token exists (the token itself is never shown), and whether pairing mode is open |
 | `telemetry.*` | Raw and 5-minute average PM2.5, TVOC and NOx, plus CO₂, temperature and humidity |
 | `matter_commissioned`, `matter_fabrics_count` | Matter pairing state |
+| `firmware_version`, `firmware_build` | SemVer firmware version (`"0.9.0"`) and short Git SHA build stamp (with `-dirty` if uncommitted changes were present) |
 | `speed_changes_today`, `wifi_rssi_dbm`, `free_heap_bytes`, `uptime_s`, `ir_frames_sent` | Diagnostics |
 
 ### Configuration reference
@@ -549,6 +551,26 @@ pio device monitor -e atoms3
   injection under `-DWOKWI_SIM`). Wokwi has no Bluetooth, so Matter pairing can't be simulated.
 - **Agent support:** `GEMINI.md` and `.agents/` hold the context, rules and skills used by
   the AI coding agent working on this repo.
+
+### Versioning & release process
+
+- **Version format:** Semantic Versioning (`MAJOR.MINOR.PATCH` in [`include/fw_version.h`](include/fw_version.h))
+  plus an automatic short Git commit SHA injected at build time by [`scripts/version_build_flags.py`](scripts/version_build_flags.py)
+  (appending `-dirty` when tracked files have uncommitted edits).
+- **Where it appears:** Boot serial log, `GET /api/v1/status` (`firmware_version`, `firmware_build`),
+  `GET /` JSON index, and the Web Dashboard footer.
+- **Dogfooding & iteration workflow:** Keep the base version unchanged while implementing fixes or
+  features and dogfooding builds on real hardware; use `firmware_build` (`<sha>` / `<sha>-dirty`) in the
+  Web Dashboard footer or `/api/v1/status` to verify the exact build running on each device.
+- **Bumping & tagging a release:** Only bump the release version after the fixes or features are
+  tested and verified on hardware. Use [`scripts/release.sh`](scripts/release.sh) from a clean working
+  tree:
+  ```bash
+  ./scripts/release.sh 0.9.1 -m "Describe verified fixes" --push
+  ```
+  The script updates `include/fw_version.h`, runs `pio test -e native` and `pio run -e atoms3`,
+  commits the bump, creates an annotated Git tag (`v0.9.1`), rebuilds `.pio/build/atoms3/firmware.bin`
+  with clean commit metadata, and optionally pushes the branch and tag to `origin`.
 
 ---
 

@@ -24,6 +24,7 @@
 
 #include "ag_client.h"
 #include "clock_sync.h"
+#include "fw_version.h"
 #include "iaq_algorithm.h"
 #include "ir_nec_purifier.h"
 #include "matter_ha_bridge.h"
@@ -698,7 +699,8 @@ void handle_sim_serial() {
 void setup() {
   Serial.begin(115200);
   delay(1500);  // let USB-CDC enumerate so boot logs are visible (setup only)
-  ESP_LOGI(kTag, "atoms3-iaq-matter-controller boot, heap=%u", static_cast<unsigned>(esp_get_free_heap_size()));
+  ESP_LOGI(kTag, "atoms3-iaq-matter-controller v%s (%s) boot, heap=%u", kFwVersion, kFwGitSha,
+           static_cast<unsigned>(esp_get_free_heap_size()));
 
   // Task watchdog: 15 s, panic on trigger; keep Core 0 IDLE task watched (matching
   // sdkconfig CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0=y so LittleFS::format()'s

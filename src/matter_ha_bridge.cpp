@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "fw_version.h"
 #include "sys_config.h"
 
 // ---------------------------------------------------------------------------
@@ -1007,6 +1008,8 @@ esp_err_t h_status(httpd_req_t* req) {
   size_t n = 0;
   {
     JsonDocument doc(&arena);
+    doc["firmware_version"] = kFwVersion;
+    doc["firmware_build"] = kFwGitSha;
     doc["current_speed"] = s.current_speed;
     doc["operating_mode"] = operating_mode_to_str(s.operating_mode);
     doc["pm_target_speed"] = s.pm_target_speed;
@@ -1167,7 +1170,8 @@ esp_err_t h_root(httpd_req_t* req) {
   const char* a = header(req, "Accept", accept, sizeof(accept));
   if (a != nullptr && ascii_contains_ci(a, "application/json") && !ascii_contains_ci(a, "text/html")) {
     static const char kIdx[] =
-        "{\"device\":\"atoms3-iaq-matter-controller\",\"endpoints\":[\"GET /api/v1/status\","
+        "{\"device\":\"atoms3-iaq-matter-controller\",\"firmware_version\":\"" FW_VERSION_STR
+        "\",\"firmware_build\":\"" FW_GIT_SHA "\",\"endpoints\":[\"GET /api/v1/status\","
         "\"GET /api/v1/events\",\"GET /api/v1/config\",\"PATCH /api/v1/config (auth)\","
         "\"POST /api/v1/command (auth)\",\"POST /api/v1/ota (auth)\","
         "\"POST /api/v1/pair (pairing mode)\"],\"auth\":\"Authorization: Bearer <token>\"}";

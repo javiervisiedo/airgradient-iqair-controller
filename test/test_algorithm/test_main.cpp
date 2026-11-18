@@ -9,6 +9,7 @@
 #include "ag_client.h"
 #include "api_auth.h"
 #include "clock_sync.h"
+#include "fw_version.h"
 #include "iaq_algorithm.h"
 #include "ir_nec_purifier.h"
 #include "matter_ha_bridge.h"
@@ -1440,6 +1441,21 @@ void test_matter_fan_control_auto_transition_helpers() {
   TEST_ASSERT_FALSE(matter_bridge_cmd_caught_up(0, 42, 42, true));    // deferred FanMode=High timer active
 }
 
+void test_firmware_version_metadata() {
+  TEST_ASSERT_NOT_NULL(kFwVersion);
+  TEST_ASSERT_TRUE(strlen(kFwVersion) >= 5);
+  TEST_ASSERT_NOT_NULL(kFwGitSha);
+  TEST_ASSERT_TRUE(strlen(kFwGitSha) > 0);
+  TEST_ASSERT_EQUAL_UINT32(
+      static_cast<uint32_t>(kFwVersionMajor) * 10000u +
+          static_cast<uint32_t>(kFwVersionMinor) * 100u +
+          static_cast<uint32_t>(kFwVersionPatch),
+      kFwVersionCode);
+  char expected[24];
+  snprintf(expected, sizeof(expected), "%u.%u.%u", kFwVersionMajor, kFwVersionMinor, kFwVersionPatch);
+  TEST_ASSERT_EQUAL_STRING(expected, kFwVersion);
+}
+
 int main(int, char**) {
   UNITY_BEGIN();
   RUN_TEST(test_TC01_matter_slider_sets_manual_and_auto_resumes);
@@ -1498,5 +1514,6 @@ int main(int, char**) {
   RUN_TEST(test_event_log_ring_buffer_and_json);
   RUN_TEST(test_command_json_validation);
   RUN_TEST(test_matter_fan_control_auto_transition_helpers);
+  RUN_TEST(test_firmware_version_metadata);
   return UNITY_END();
 }
